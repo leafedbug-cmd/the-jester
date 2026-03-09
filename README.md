@@ -28,11 +28,15 @@ This project is intended for educational purposes, security research, and testin
 
 ### Pin Configuration
 
-| Component | ESP32 Pin |
-|-----------|-----------|
-| nRF24L01 1 (VSPI) | GPIO 22 (CE)<br>GPIO 21 (CSN)<br>GPIO 18 (SCK)<br>GPIO 23 (MOSI)<br>GPIO 19 (MISO) |
-| nRF24L01 2 (HSPI) | GPIO 16 (CE)<br>GPIO 15 (CSN)<br>GPIO 14 (SCK)<br>GPIO 13 (MOSI)<br>GPIO 12 (MISO) |
-| LED | GPIO 27 | - |
+| Signal | ESP32 Pin | Description |
+|--------|-----------|-------------|
+| `LED_PIN` | GPIO 48 | WS2812 RGB LED |
+| `CSN_PIN` | GPIO 10 | nRF24L01 CSN |
+| `CE_PIN` | GPIO 9 | nRF24L01 CE |
+| `SCK_PIN` | GPIO 12 | SPI CLK |
+| `MOSI_PIN` | GPIO 11 | SPI MOSI |
+| `MISO_PIN` | GPIO 13 | SPI MISO |
+| `JAM_SWITCH` | GPIO 21 | External 3-pin switch |
 
 ## 🔌 Hardware Setup
 
