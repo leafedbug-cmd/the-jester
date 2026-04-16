@@ -44,8 +44,8 @@
 #define NRF_CLK   17   // grey  — header pin 14 (split to both radios)
 #define NRF_MOSI  18   // yellow — header pin 16 (split to both radios)
 #define NRF_MISO  21   // purple — header pin 5  (split to both radios)
-#define NRF_CE_A   9   // white  — header pin 12 (Radio A)
-#define NRF_CSN_A 10   // orange — header pin 10 (Radio A)
+#define NRF_CE_A  19  // white  — header pin 4  (Radio A)
+#define NRF_CSN_A 20  // orange — header pin 3  (Radio A)
 #define NRF_CE_B  38   // white  — header pin 7  (Radio B)
 #define NRF_CSN_B 47   // orange — header pin 20 (Radio B) — GPIO46 is strapping pin, avoid
 
