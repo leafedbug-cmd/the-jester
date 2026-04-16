@@ -217,7 +217,7 @@ void drawUI() {
 // ---------------------------------------------------------------------------
 // Radio config
 // ---------------------------------------------------------------------------
-bool configureRadio(RF24 &radio, int channel) {
+bool configureRadio(RF24 &radio) {
   if (radio.begin(&spiHSPI)) {
     radio.setAutoAck(false);
     radio.stopListening();
@@ -225,7 +225,6 @@ bool configureRadio(RF24 &radio, int channel) {
     radio.setPALevel(RF24_PA_MAX, true);
     radio.setDataRate(RF24_2MBPS);
     radio.setCRCLength(RF24_CRC_DISABLED);
-    radio.startConstCarrier(RF24_PA_HIGH, channel);
     Serial.println("Radio OK");
     return true;
   } else {
@@ -238,6 +237,10 @@ bool configureRadio(RF24 &radio, int channel) {
 // Mode control
 // ---------------------------------------------------------------------------
 void activateMode(Mode mode) {
+  if (mode == OFF) {
+    if (radioAok) radioA.stopConstCarrier();
+    if (radioBok) radioB.stopConstCarrier();
+  }
   currentMode = mode;
   Serial.println("Mode: " + getModeString(mode));
   drawUI();
@@ -248,14 +251,14 @@ void activateMode(Mode mode) {
 // ---------------------------------------------------------------------------
 void jamBLE() {
   int ch = ble_channels[random(0, sizeof(ble_channels)/sizeof(ble_channels[0]))];
-  radioA.setChannel(ch);
-  radioB.setChannel(ch);
+  if (radioAok) radioA.startConstCarrier(RF24_PA_HIGH, ch);
+  if (radioBok) radioB.startConstCarrier(RF24_PA_HIGH, ch);
 }
 
 void jamBluetooth() {
   int ch = bluetooth_channels[random(0, sizeof(bluetooth_channels)/sizeof(bluetooth_channels[0]))];
-  radioA.setChannel(ch);
-  radioB.setChannel(ch);
+  if (radioAok) radioA.startConstCarrier(RF24_PA_HIGH, ch);
+  if (radioBok) radioB.startConstCarrier(RF24_PA_HIGH, ch);
 }
 
 void jamAll() {
@@ -397,8 +400,9 @@ void setup() {
   // NRF24 SPI bus — HSPI shared by both radios (split grey/yellow/purple wires)
   spiHSPI.begin(NRF_CLK, NRF_MISO, NRF_MOSI, -1);
 
-  radioAok = configureRadio(radioA, ble_channels[0]);        // Radio A → BLE
-  radioBok = configureRadio(radioB, bluetooth_channels[0]);  // Radio B → Bluetooth
+  radioAok = configureRadio(radioA);  // Radio A
+  delay(10);
+  radioBok = configureRadio(radioB);  // Radio B
   drawUI();  // redraw to update status dots
 
   Serial.println("The Jester — Waveshare ESP32-S3-Touch-LCD-3.5-C");
