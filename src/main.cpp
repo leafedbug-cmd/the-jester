@@ -46,7 +46,7 @@
 #define NRF_MISO  21
 #define NRF_CE_A  9    // Radio A — BLE jammer
 #define NRF_CSN_A 10
-#define NRF_CE_B  11   // Radio B — Bluetooth jammer
+#define NRF_CE_B  38   // Radio B — Bluetooth jammer (header pin 7)
 #define NRF_CSN_B 46
 
 constexpr int SPI_SPEED = 16000000;
