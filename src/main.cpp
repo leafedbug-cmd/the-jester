@@ -39,21 +39,15 @@
 #define FT6336_ADDR   0x38
 
 // ---------------------------------------------------------------------------
-// NRF24L01 SPI — each radio gets its own SPI pins (no wire splitting)
-// HSPI peripheral is remapped before each radio access.
+// NRF24L01 SPI bus (HSPI — shared SCK/MOSI/MISO, split via splitters)
 // ---------------------------------------------------------------------------
-// Radio A SPI pins (header)
-#define NRF_CLK_A   17   // header pin 14
-#define NRF_MOSI_A  18   // header pin 16
-#define NRF_MISO_A  21   // header pin 5
-#define NRF_CE_A     9   // header pin 12
-#define NRF_CSN_A   10   // header pin 10
-// Radio B SPI pins (header — separate wires)
-#define NRF_CLK_B   40   // header pin 11
-#define NRF_MOSI_B  41   // header pin 13
-#define NRF_MISO_B  42   // header pin 15
-#define NRF_CE_B    38   // header pin 7
-#define NRF_CSN_B   46   // header pin 19
+#define NRF_CLK   17   // grey  — header pin 14 (split to both radios)
+#define NRF_MOSI  18   // yellow — header pin 16 (split to both radios)
+#define NRF_MISO  21   // purple — header pin 5  (split to both radios)
+#define NRF_CE_A   9   // white  — header pin 12 (Radio A)
+#define NRF_CSN_A 10   // orange — header pin 10 (Radio A)
+#define NRF_CE_B  38   // white  — header pin 7  (Radio B)
+#define NRF_CSN_B 46   // orange — header pin 19 (Radio B)
 
 constexpr int SPI_SPEED = 16000000;
 
@@ -212,19 +206,6 @@ void drawUI() {
 }
 
 // ---------------------------------------------------------------------------
-// Radio SPI bus switching — remap HSPI pins before each radio access
-// ---------------------------------------------------------------------------
-void selectRadioA() {
-  spiHSPI.end();
-  spiHSPI.begin(NRF_CLK_A, NRF_MISO_A, NRF_MOSI_A, -1);
-}
-
-void selectRadioB() {
-  spiHSPI.end();
-  spiHSPI.begin(NRF_CLK_B, NRF_MISO_B, NRF_MOSI_B, -1);
-}
-
-// ---------------------------------------------------------------------------
 // Radio config
 // ---------------------------------------------------------------------------
 void configureRadio(RF24 &radio, int channel) {
@@ -256,17 +237,13 @@ void activateMode(Mode mode) {
 // ---------------------------------------------------------------------------
 void jamBLE() {
   int ch = ble_channels[random(0, sizeof(ble_channels)/sizeof(ble_channels[0]))];
-  selectRadioA();
   radioA.setChannel(ch);
-  selectRadioB();
   radioB.setChannel(ch);
 }
 
 void jamBluetooth() {
   int ch = bluetooth_channels[random(0, sizeof(bluetooth_channels)/sizeof(bluetooth_channels[0]))];
-  selectRadioA();
   radioA.setChannel(ch);
-  selectRadioB();
   radioB.setChannel(ch);
 }
 
@@ -405,10 +382,10 @@ void setup() {
   esp_wifi_deinit();
   esp_wifi_disconnect();
 
-  // NRF24 — init Radio A on its SPI pins, then Radio B on its own pins
-  selectRadioA();
+  // NRF24 SPI bus — HSPI shared by both radios (split grey/yellow/purple wires)
+  spiHSPI.begin(NRF_CLK, NRF_MISO, NRF_MOSI, -1);
+
   configureRadio(radioA, ble_channels[0]);        // Radio A → BLE
-  selectRadioB();
   configureRadio(radioB, bluetooth_channels[0]);  // Radio B → Bluetooth
 
   Serial.println("The Jester — Waveshare ESP32-S3-Touch-LCD-3.5-C");
