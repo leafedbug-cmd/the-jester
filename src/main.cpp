@@ -22,17 +22,18 @@
 // ---------------------------------------------------------------------------
 // LCD hardware pins  (SPI2/FSPI — internal, NOT on the header)
 // ---------------------------------------------------------------------------
-#define LCD_SCLK   3
-#define LCD_MOSI   2
-#define LCD_MISO  -1   // write-only
-#define LCD_CS     5
-#define LCD_DC     4
-#define LCD_BL     6   // backlight PWM
+#define LCD_SCLK   5
+#define LCD_MOSI   1
+#define LCD_MISO   2
+#define LCD_CS    -1   // not wired on this board
+#define LCD_DC     3
+#define LCD_BL     6   // fallback backlight GPIO (also driven by TCA P0)
 
-// TCA9554 IO expander (I2C 0x20) — EXIO1 drives LCD reset
+// TCA9554 IO expander (I2C 0x20) — P0=backlight, P1=LCD reset
 #define I2C_SDA    8
 #define I2C_SCL    7
-#define TCA_LCD_RST_PIN  1   // TCA9554 output index that controls LCD RST
+#define TCA_BL_PIN       0   // TCA9554 P0 — backlight enable
+#define TCA_LCD_RST_PIN  1   // TCA9554 P1 — LCD reset
 
 // Touch controller FT6336 I2C address
 #define FT6336_ADDR   0x38
@@ -343,22 +344,30 @@ void handleCommand() {
 void setup() {
   Serial.begin(115200);
 
-  // I2C for TCA9554 IO expander + FT6336 touch
+  // 1. I2C for TCA9554 IO expander + FT6336 touch
   Wire.begin(I2C_SDA, I2C_SCL);
 
-  // TCA9554 — assert then release LCD RST via IO expander
+  // 2. Init TCA9554 at 0x20
   tca.begin();
+
+  // 3. Set P0 (backlight) and P1 (LCD reset) as outputs
+  tca.pinMode1(TCA_BL_PIN, OUTPUT);
   tca.pinMode1(TCA_LCD_RST_PIN, OUTPUT);
+
+  // 4. Backlight on — TCA P0 HIGH + fallback GPIO6 HIGH
+  tca.write1(TCA_BL_PIN, 1);
+  pinMode(LCD_BL, OUTPUT);
+  digitalWrite(LCD_BL, HIGH);
+
+  // 5. LCD reset pulse: HIGH → LOW → HIGH
+  tca.write1(TCA_LCD_RST_PIN, 1);
+  delay(10);
   tca.write1(TCA_LCD_RST_PIN, 0);
   delay(10);
   tca.write1(TCA_LCD_RST_PIN, 1);
   delay(120);
 
-  // Backlight on
-  pinMode(LCD_BL, OUTPUT);
-  digitalWrite(LCD_BL, HIGH);
-
-  // Display init (SPI2/FSPI, landscape)
+  // 6. Display init (SPI2/FSPI, ST7796, landscape)
   if (!gfx->begin()) {
     Serial.println("Display init FAILED");
   }
