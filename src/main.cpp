@@ -3,8 +3,8 @@
 //  Board   : ESP32-S3R8, 16MB Flash, 8MB OPI PSRAM
 //  Display : ST7796 SPI 480×320 landscape via GFX Library for Arduino + TCA9554
 //  Touch   : FT6336 I2C (SDA=GPIO8, SCL=GPIO7)
-//  Radio 1 : NRF24L01+PA+LNA  CE=GPIO9  CSN=GPIO10  (BLE jammer)
-//  Radio 2 : NRF24L01+PA+LNA  CE=GPIO11 CSN=GPIO46  (Bluetooth jammer)
+//  Radio A : NRF24L01+PA+LNA  CE=GPIO9  CSN=GPIO10  (left dot)
+//  Radio B : NRF24L01+PA+LNA  CE=GPIO38 CSN=GPIO47  (right dot)
 //  SPI bus : HSPI  CLK=GPIO17  MOSI=GPIO18  MISO=GPIO21  (both radios)
 //  NOTE: Add 220µF cap on each radio's VCC pin.
 // =============================================================================
@@ -44,8 +44,8 @@
 #define NRF_CLK   17   // grey  — header pin 14 (split to both radios)
 #define NRF_MOSI  18   // yellow — header pin 16 (split to both radios)
 #define NRF_MISO  21   // purple — header pin 5  (split to both radios)
-#define NRF_CE_A  19  // white  — header pin 4  (Radio A)
-#define NRF_CSN_A 20  // orange — header pin 3  (Radio A)
+#define NRF_CE_A   9   // white  — top row header (Radio A)
+#define NRF_CSN_A 10   // orange — top row header (Radio A)
 #define NRF_CE_B  38   // white  — header pin 7  (Radio B)
 #define NRF_CSN_B 47   // orange — header pin 20 (Radio B) — GPIO46 is strapping pin, avoid
 
@@ -400,9 +400,13 @@ void setup() {
   // NRF24 SPI bus — HSPI shared by both radios (split grey/yellow/purple wires)
   spiHSPI.begin(NRF_CLK, NRF_MISO, NRF_MOSI, -1);
 
+  Serial.println("Initializing Radio A (CE=" + String(NRF_CE_A) + " CSN=" + String(NRF_CSN_A) + ")...");
   radioAok = configureRadio(radioA);  // Radio A
+  Serial.println("Radio A: " + String(radioAok ? "OK" : "FAIL"));
   delay(10);
+  Serial.println("Initializing Radio B (CE=" + String(NRF_CE_B) + " CSN=" + String(NRF_CSN_B) + ")...");
   radioBok = configureRadio(radioB);  // Radio B
+  Serial.println("Radio B: " + String(radioBok ? "OK" : "FAIL"));
   drawUI();  // redraw to update status dots
 
   Serial.println("The Jester — Waveshare ESP32-S3-Touch-LCD-3.5-C");
