@@ -73,10 +73,14 @@ Arduino_GFX *gfx = new Arduino_ST7796(bus, GFX_NOT_DEFINED, 1 /*rotation*/, true
 #define COL_BT      0xF800u  // red
 #define COL_BOTH    0xFC00u  // orange
 #define COL_ACTIVE  0xFFE0u  // yellow highlight border
+#define COL_GREEN   0x07E0u  // radio OK
+#define COL_RED     0xF800u  // radio FAIL
 
 // ---------------------------------------------------------------------------
 // Radio
 // ---------------------------------------------------------------------------
+bool radioAok = false;
+bool radioBok = false;
 SPIClass spiHSPI(HSPI);
 RF24 radioA(NRF_CE_A, NRF_CSN_A, SPI_SPEED);
 RF24 radioB(NRF_CE_B, NRF_CSN_B, SPI_SPEED);
@@ -172,6 +176,11 @@ void drawTitleBar() {
   int tw = strlen(title) * 12;  // ~12px per char at size 2
   gfx->setCursor((480 - tw) / 2, (TITLE_H - 16) / 2);
   gfx->print(title);
+
+  // Radio status dots — top-right corner, 8px radius
+  // Dot A at (440, 20), Dot B at (462, 20)
+  gfx->fillCircle(440, 20, 8, radioAok ? COL_GREEN : COL_RED);
+  gfx->fillCircle(462, 20, 8, radioBok ? COL_GREEN : COL_RED);
 }
 
 void drawButton(int idx, bool active) {
@@ -208,7 +217,7 @@ void drawUI() {
 // ---------------------------------------------------------------------------
 // Radio config
 // ---------------------------------------------------------------------------
-void configureRadio(RF24 &radio, int channel) {
+bool configureRadio(RF24 &radio, int channel) {
   if (radio.begin(&spiHSPI)) {
     radio.setAutoAck(false);
     radio.stopListening();
@@ -218,8 +227,10 @@ void configureRadio(RF24 &radio, int channel) {
     radio.setCRCLength(RF24_CRC_DISABLED);
     radio.startConstCarrier(RF24_PA_HIGH, channel);
     Serial.println("Radio OK");
+    return true;
   } else {
     Serial.println("Radio FAIL — check wiring & 220uF cap");
+    return false;
   }
 }
 
@@ -385,8 +396,9 @@ void setup() {
   // NRF24 SPI bus — HSPI shared by both radios (split grey/yellow/purple wires)
   spiHSPI.begin(NRF_CLK, NRF_MISO, NRF_MOSI, -1);
 
-  configureRadio(radioA, ble_channels[0]);        // Radio A → BLE
-  configureRadio(radioB, bluetooth_channels[0]);  // Radio B → Bluetooth
+  radioAok = configureRadio(radioA, ble_channels[0]);        // Radio A → BLE
+  radioBok = configureRadio(radioB, bluetooth_channels[0]);  // Radio B → Bluetooth
+  drawUI();  // redraw to update status dots
 
   Serial.println("The Jester — Waveshare ESP32-S3-Touch-LCD-3.5-C");
   Serial.println("Mode: " + getModeString(currentMode));
