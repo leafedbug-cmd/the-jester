@@ -49,7 +49,7 @@
 #define NRF_CE_B  38   // white  — header pin 7  (Radio B)
 #define NRF_CSN_B 46   // orange — header pin 19 (Radio B)
 
-constexpr int SPI_SPEED = 16000000;
+constexpr int SPI_SPEED = 800000;
 
 // ---------------------------------------------------------------------------
 // Display — landscape 480×320
@@ -292,12 +292,14 @@ bool readTouch(int16_t &sx, int16_t &sy) {
   uint8_t yl = Wire.read();
   Wire.read();  // weight
 
-  int16_t raw_x = ((xh & 0x0F) << 8) | xl;  // 0–479 in portrait (width axis)
-  int16_t raw_y = ((yh & 0x0F) << 8) | yl;  // 0–319 in portrait (height axis)
+  int16_t raw_x = ((xh & 0x0F) << 8) | xl;  // 0–319 (portrait width axis)
+  int16_t raw_y = ((yh & 0x0F) << 8) | yl;  // 0–479 (portrait height axis)
 
-  // rotation=1 (landscape): screen X = raw_x, screen Y = (319 - raw_y)
-  sx = raw_x;
-  sy = 319 - raw_y;
+  // rotation=1 landscape: portrait height axis becomes screen X (0–479)
+  //                        portrait width axis becomes screen Y (0–319, inverted)
+  sx = raw_y;
+  sy = 319 - raw_x
+  sy = 319 - raw_x;
   return true;
 }
 
