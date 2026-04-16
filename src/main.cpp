@@ -298,7 +298,6 @@ bool readTouch(int16_t &sx, int16_t &sy) {
   // rotation=1 landscape: portrait height axis becomes screen X (0–479)
   //                        portrait width axis becomes screen Y (0–319, inverted)
   sx = raw_y;
-  sy = 319 - raw_x
   sy = 319 - raw_x;
   return true;
 }
