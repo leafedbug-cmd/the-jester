@@ -47,7 +47,7 @@
 #define NRF_CE_A   9   // white  — header pin 12 (Radio A)
 #define NRF_CSN_A 10   // orange — header pin 10 (Radio A)
 #define NRF_CE_B  38   // white  — header pin 7  (Radio B)
-#define NRF_CSN_B 46   // orange — header pin 19 (Radio B)
+#define NRF_CSN_B 47   // orange — header pin 20 (Radio B) — GPIO46 is strapping pin, avoid
 
 constexpr int SPI_SPEED = 800000;
 
