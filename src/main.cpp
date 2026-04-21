@@ -1,259 +1,179 @@
-#include "RF24.h"
+#include <Arduino.h>
+#include <Preferences.h>
 #include <SPI.h>
-#include "esp_bt.h"
-#include "esp_wifi.h"
-#include "Preferences.h"
+#include <esp_bt.h>
+#include <esp_wifi.h>
 
-constexpr int SPI_SPEED = 16000000;
-constexpr int LED_PIN = 27;
+#include "esp32_nrf24_jammer/esp32_nrf24_jammer.h"
 
-SPIClass *spiVSPI = nullptr;
-SPIClass *spiHSPI = nullptr;
-RF24 radioVSPI(22, 21, SPI_SPEED);
-RF24 radioHSPI(16, 15, SPI_SPEED);
+namespace {
+constexpr int8_t  kLedPin        = 48;
+constexpr uint8_t kBootButtonPin = 0;
+constexpr uint8_t kModeCount     = 5;
 
-int bluetooth_channels[] = {32, 34, 46, 48, 50, 52, 0, 1, 2, 4, 6, 8, 22, 24, 26, 28, 30, 74, 76, 78, 80};
-int ble_channels[] = {2, 26, 80};
+constexpr uint8_t kRadio1CePin  = 4;
+constexpr uint8_t kRadio1CsnPin = 5;
+constexpr uint8_t kRadioSckPin  = 6;
+constexpr uint8_t kRadioMosiPin = 7;
+constexpr uint8_t kRadioMisoPin = 15;
 
-enum Mode {
-  OFF,
-  BLUETOOTH,
-  BLE,
-  BOTH
-};
+constexpr uint8_t kRadio2CePin  = 16;
+constexpr uint8_t kRadio2CsnPin = 17;
 
-Mode currentMode = OFF;
-String inputString = "";
-unsigned long lastBlinkTime = 0;
-int blinkCount = 0;
-bool ledOn = false;
+SPIClass gRadioSpi(FSPI);
+Preferences gPreferences;
 
-Preferences preferences;
-
-String getModeString(Mode mode) {
-  switch (mode) {
-    case OFF:
-      return "OFF";
-    case BLUETOOTH:
-      return "BLUETOOTH";
-    case BLE:
-      return "BLE";
-    case BOTH:
-      return "BOTH";
-    default:
-      return "UNKNOWN";
-  }
+NRF24RadioConfig makeRadioConfig(SPIClass& spi, uint8_t cePin, uint8_t csnPin) {
+    NRF24RadioConfig config;
+    config.spi     = &spi;
+    config.cePin   = cePin;
+    config.csnPin  = csnPin;
+    config.sckPin  = kRadioSckPin;
+    config.mosiPin = kRadioMosiPin;
+    config.misoPin = kRadioMisoPin;
+    return config;
 }
 
-void saveDefaultMode(Mode mode) {
-  preferences.begin("rfclown", false);
-  preferences.putUChar("mode", (uint8_t)mode);
-  preferences.end();
-  Serial.println("Default mode: " + getModeString(mode));
-}
+NRF24RadioConfig gPrimaryRadioConfig   = makeRadioConfig(gRadioSpi, kRadio1CePin, kRadio1CsnPin);
+NRF24RadioConfig gSecondaryRadioConfig = makeRadioConfig(gRadioSpi, kRadio2CePin, kRadio2CsnPin);
+ESP32NRF24Jammer gJammer(kLedPin, gPrimaryRadioConfig, gSecondaryRadioConfig);
 
-Mode loadDefaultMode() {
-  preferences.begin("rfclown", false);
-  uint8_t mode = preferences.getUChar("mode", (uint8_t)OFF);
-  preferences.end();
-  return (Mode)mode;
-}
+// RGB party state for ALL mode
+uint8_t gPartyHue = 0;
 
-void sendCurrentMode() {
-  if (Serial) {
-    Serial.println("default:" + getModeString(currentMode));
-    Serial.flush();
-  }
-}
-
-void configureRadio(RF24 &radio, int channel, SPIClass *spi) {
-    if (radio.begin(spi)) {
-        radio.setAutoAck(false);
-        radio.stopListening();
-        radio.setRetries(0, 0);
-        radio.setPALevel(RF24_PA_MAX, true);
-        radio.setDataRate(RF24_2MBPS);
-        radio.setCRCLength(RF24_CRC_DISABLED);
-        radio.startConstCarrier(RF24_PA_HIGH, channel);
+void hsvToRgb(uint8_t h, uint8_t& r, uint8_t& g, uint8_t& b) {
+    uint8_t region = h / 43;
+    uint8_t rem    = (h - region * 43) * 6;
+    uint8_t q      = 255 - rem;
+    uint8_t t      = rem;
+    switch (region) {
+        case 0: r = 255; g = t;   b = 0;   break;
+        case 1: r = q;   g = 255; b = 0;   break;
+        case 2: r = 0;   g = 255; b = t;   break;
+        case 3: r = 0;   g = q;   b = 255; break;
+        case 4: r = t;   g = 0;   b = 255; break;
+        default:r = 255; g = 0;   b = q;   break;
     }
+}
+
+void setLedForMode(JammerMode mode) {
+    switch (mode) {
+        case JammerMode::Bluetooth: neopixelWrite(kLedPin,   0,   0, 255); break; // blue
+        case JammerMode::Ble:       neopixelWrite(kLedPin, 255,  20, 147); break; // pink
+        case JammerMode::Wifi:      neopixelWrite(kLedPin,   0, 255,   0); break; // green
+        case JammerMode::All: {
+            uint8_t r, g, b;
+            hsvToRgb(gPartyHue, r, g, b);
+            neopixelWrite(kLedPin, r, g, b);
+            break;
+        }
+        case JammerMode::Off:
+            // pulsing red handled in updateOffPulse()
+            break;
+    }
+}
+
+void updateOffPulse() {
+    static unsigned long lastPulseMs = 0;
+    static uint8_t brightness = 0;
+    static int8_t direction = 4;
+    if (millis() - lastPulseMs < 16) return;
+    lastPulseMs = millis();
+    neopixelWrite(kLedPin, brightness, 0, 0);
+    brightness = static_cast<uint8_t>(brightness + direction);
+    if (brightness >= 200) direction = -4;
+    if (brightness == 0)   direction =  4;
+}
+
+void savePreferredMode(JammerMode mode) {
+    gPreferences.begin("the-jester", false);
+    gPreferences.putUChar("default_mode", static_cast<uint8_t>(mode));
+    gPreferences.end();
+}
+
+JammerMode loadPreferredMode() {
+    gPreferences.begin("the-jester", true);
+    const uint8_t stored = gPreferences.getUChar("default_mode", static_cast<uint8_t>(JammerMode::Bluetooth));
+    gPreferences.end();
+    if (stored >= kModeCount) {
+        return JammerMode::Bluetooth;
+    }
+    return static_cast<JammerMode>(stored);
+}
 }
 
 void setup() {
-  Serial.begin(115200);
+    Serial.begin(921600);
+    delay(1500);
 
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
-  
-  currentMode = loadDefaultMode();
-   
-  esp_bt_controller_deinit();
-  esp_wifi_stop();
-  esp_wifi_deinit();
-  esp_wifi_disconnect();
-  
-  spiVSPI = new SPIClass(VSPI);
-  spiVSPI->begin();
-  configureRadio(radioVSPI, ble_channels[0], spiVSPI);
-  
-  spiHSPI = new SPIClass(HSPI);
-  spiHSPI->begin();
-  configureRadio(radioHSPI, bluetooth_channels[0], spiHSPI);
+    Serial.println("\n\n===== THE JESTER / SPARKLE IOT S3N16R8 =====");
+    Serial.printf("Flash Size: %u MB\n", ESP.getFlashChipSize() / 1024 / 1024);
+    Serial.printf("Free Heap: %u KB\n", ESP.getFreeHeap() / 1024);
+    Serial.printf("PSRAM Size: %u KB\n", ESP.getPsramSize() / 1024);
 
-  Serial.println("The Jester");
-  Serial.println("Current mode: " + getModeString(currentMode));
-  
-  delay(500);
-  if (Serial) {
-    sendCurrentMode();
-  }
-}
+    esp_bt_controller_deinit();
+    esp_wifi_stop();
+    esp_wifi_deinit();
+    esp_wifi_disconnect();
 
-void activateMode(Mode mode) {
-  currentMode = mode;
-  blinkCount = 0;
-  lastBlinkTime = 0;
-  Serial.println("Mode: " + getModeString(mode));
-}
+    randomSeed(static_cast<uint32_t>(esp_random()));
 
-void handleCommand() {
-  inputString.trim();
-  inputString.toLowerCase();
-  
-  if (inputString == "help") {
-    Serial.println(
-      "mode:<mode> - set mode off, bluetooth, ble, both\n"
-      "default:<mode> - set default mode off, bluetooth, ble, both"
-    );
-    
-  } else if (inputString == "mode:off") {
-    activateMode(OFF);
-  } else if (inputString == "mode:bluetooth") {
-    activateMode(BLUETOOTH);
-  } else if (inputString == "mode:ble") {
-    activateMode(BLE);
-  } else if (inputString == "mode:both") {
-    activateMode(BOTH);
-  } else if (inputString == "default:off") {
-    saveDefaultMode(OFF);
-  } else if (inputString == "default:bluetooth") {
-    saveDefaultMode(BLUETOOTH);
-  } else if (inputString == "default:ble") {
-    saveDefaultMode(BLE);
-  } else if (inputString == "default:both") {
-    saveDefaultMode(BOTH);
-  } else {
-    Serial.print("Unknown command: ");
-    Serial.println(inputString);
-  }
-  
-  inputString = "";
-}
+    pinMode(kBootButtonPin, INPUT_PULLUP);
 
-void checkBlink(unsigned long currentTime, int interval, int times) {
-  if (ledOn) {
-    if (currentTime - lastBlinkTime >= interval) {
-      digitalWrite(LED_PIN, LOW);
-      ledOn = false;
-      blinkCount++;
-      lastBlinkTime = currentTime;
-    }
-  } else {
-    if (blinkCount < times) {
-      if (currentTime - lastBlinkTime >= interval) {
-        digitalWrite(LED_PIN, HIGH);
-        ledOn = true;
-        lastBlinkTime = currentTime;
-      }
+    Serial.println("[APP] Probing primary nRF24L01+ radio...");
+    if (gJammer.beginPrimary()) {
+        Serial.println("[APP] Primary radio OK");
     } else {
-      if (currentTime - lastBlinkTime >= 1000) {
-        digitalWrite(LED_PIN, HIGH);
-        ledOn = true;
-        blinkCount = 0;
-        lastBlinkTime = currentTime;
-      }
+        Serial.println("[APP] Primary radio FAILED");
     }
-  }
-}
 
-void handleLed() {
-  unsigned long currentTime = millis();
-  
-  switch (currentMode) {
-    case OFF:
-      digitalWrite(LED_PIN, LOW);
-      break;
-      
-    case BLUETOOTH:
-      checkBlink(currentTime, 1000, 1);
-      break;
-      
-    case BLE:
-      checkBlink(currentTime, 300, 2);
-      break;
-      
-    case BOTH:
-      checkBlink(currentTime, 200, 3);
-      break;
-  }
-}
-
-void jamBLE() {
-  int randomIndex = random(0, sizeof(ble_channels) / sizeof(ble_channels[0]));
-  int channel = ble_channels[randomIndex];
-  radioVSPI.setChannel(channel);
-  radioHSPI.setChannel(channel);
-}
-
-void jamBluetooth() {
-  int randomIndex = random(0, sizeof(bluetooth_channels) / sizeof(bluetooth_channels[0]));
-  int channel = bluetooth_channels[randomIndex];
-  radioVSPI.setChannel(channel);
-  radioHSPI.setChannel(channel);
-}
-
-void jamAll() {
-  if (random(0, 2)) {
-      jamBluetooth();        
-  } else {
-      jamBLE();
-  }
-  //delayMicroseconds(20);
-}
-
-void executeMode() {
-    switch (currentMode) {
-        case OFF:
-            //radioVSPI.powerDown();
-            //radioHSPI.powerDown();
-            delay(100);
-            break;
-        case BLE:
-            jamBLE();
-            break;
-        case BLUETOOTH:
-            jamBluetooth();
-            break;
-        case BOTH:
-            jamAll();
-            break;
+    Serial.println("[APP] Probing secondary nRF24L01+ radio...");
+    if (gJammer.beginSecondary()) {
+        Serial.println("[APP] Secondary radio OK");
+    } else {
+        Serial.println("[APP] Secondary radio FAILED");
     }
+
+    gJammer.setMode(JammerMode::Bluetooth);
+    setLedForMode(JammerMode::Bluetooth);
+    Serial.printf("[APP] Boot mode: BLUETOOTH | Radios ready: %u\n", gJammer.getReadyRadioCount());
 }
 
 void loop() {
-  handleLed();
-  executeMode();
-}
+    static unsigned long lastButtonMs    = 0;
+    static unsigned long lastHeartbeatMs = 0;
+    static unsigned long lastPartyMs     = 0;
 
-void serialEvent() {
-  while (Serial.available()) {
-    char inChar = (char)Serial.read();
-    
-    if (inChar == '\n') {
-      if (inputString.length() > 0) {
-        handleCommand();
-      }
-    } else {
-      inputString += inChar;
+    // BOOT button cycles modes
+    if (digitalRead(kBootButtonPin) == LOW && (millis() - lastButtonMs) > 200) {
+        lastButtonMs = millis();
+        const JammerMode next = static_cast<JammerMode>((static_cast<uint8_t>(gJammer.getMode()) + 1) % kModeCount);
+        gJammer.setMode(next);
+        setLedForMode(next);
+        savePreferredMode(next);
+        Serial.printf("[APP] Mode -> %s\n", jammerModeName(next));
     }
-  }
+
+    // Animate LED for special modes
+    const JammerMode mode = gJammer.getMode();
+    if (mode == JammerMode::Off) {
+        updateOffPulse();
+    } else if (mode == JammerMode::All && (millis() - lastPartyMs) > 20) {
+        lastPartyMs = millis();
+        gPartyHue += 3;
+        setLedForMode(JammerMode::All);
+    }
+
+    gJammer.update();
+
+    if ((millis() - lastHeartbeatMs) > 30000) {
+        lastHeartbeatMs = millis();
+        Serial.printf("[APP] Heap=%uKB R1=%s R2=%s Mode=%s\n",
+            ESP.getFreeHeap() / 1024,
+            gJammer.isPrimaryRadioReady()   ? "OK" : "OFF",
+            gJammer.isSecondaryRadioReady() ? "OK" : "OFF",
+            jammerModeName(gJammer.getMode()));
+    }
+
+    delay(1);
 }
