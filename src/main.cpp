@@ -3,9 +3,9 @@
 //  Board   : ESP32-S3R8, 16MB Flash, 8MB OPI PSRAM
 //  Display : ST7796 SPI 480×320 landscape via GFX Library for Arduino + TCA9554
 //  Touch   : FT6336 I2C (SDA=GPIO8, SCL=GPIO7)
-//  Radio A : NRF24L01+PA+LNA  CE=GPIO9  CSN=GPIO10  (left dot)
-//  Radio B : NRF24L01+PA+LNA  CE=GPIO38 CSN=GPIO47  (right dot)
-//  SPI bus : HSPI  CLK=GPIO17  MOSI=GPIO18  MISO=GPIO21  (both radios)
+//  Radio A : NRF24L01+PA+LNA  CE=GPIO19 CSN=GPIO20  SCK=GPIO11 MOSI=GPIO10 MISO=GPIO9
+//  Radio B : NRF24L01+PA+LNA  CE=GPIO38 CSN=GPIO39  SCK=GPIO40 MOSI=GPIO41 MISO=GPIO42
+//  SPI host: HSPI remapped per access so each radio has its own dedicated header pins
 //  NOTE: Add 220µF cap on each radio's VCC pin.
 // =============================================================================
 
@@ -39,15 +39,23 @@
 #define FT6336_ADDR   0x38
 
 // ---------------------------------------------------------------------------
-// NRF24L01 SPI bus (HSPI — shared SCK/MOSI/MISO, split via splitters)
+// NRF24L01 SPI bus
+// Radio A uses a top-row-only plug-in group: 19, 20, 11, 10, 9.
+// Radio B uses a bottom-row-only plug-in group: 38, 39, 40, 41, 42.
+// The code remaps the HSPI host before each access so the radios do not
+// share signal wires on the board header.
 // ---------------------------------------------------------------------------
-#define NRF_CLK   17   // grey  — header pin 14 (split to both radios)
-#define NRF_MOSI  18   // yellow — header pin 16 (split to both radios)
-#define NRF_MISO  21   // purple — header pin 5  (split to both radios)
-#define NRF_CE_A   9   // white  — top row header (Radio A)
-#define NRF_CSN_A 10   // orange — top row header (Radio A)
-#define NRF_CE_B  38   // white  — header pin 7  (Radio B)
-#define NRF_CSN_B 47   // orange — header pin 20 (Radio B) — GPIO46 is strapping pin, avoid
+#define NRF_CE_A   19
+#define NRF_CSN_A  20
+#define NRF_CLK_A  11
+#define NRF_MOSI_A 10
+#define NRF_MISO_A  9
+
+#define NRF_CE_B   38
+#define NRF_CSN_B  39
+#define NRF_CLK_B  40
+#define NRF_MOSI_B 41
+#define NRF_MISO_B 42
 
 constexpr int SPI_SPEED = 8000000;  // 8 MHz — NRF24 supports up to 10 MHz
 
@@ -66,15 +74,17 @@ Arduino_GFX *gfx = new Arduino_ST7796(bus, GFX_NOT_DEFINED, 1 /*rotation*/, true
 // ---------------------------------------------------------------------------
 // Colour palette
 // ---------------------------------------------------------------------------
-#define COL_BG      0x1082u  // near-black
-#define COL_TITLE   0xFFFFu  // white
-#define COL_WIFI    0x07FFu  // cyan — WiFi jammer
-#define COL_BLE     0x041Fu  // blue
-#define COL_BT      0xF800u  // red
-#define COL_JAM     0xFC00u  // orange — JAM TIME
-#define COL_ACTIVE  0xFFE0u  // yellow highlight border
-#define COL_GREEN   0x07E0u  // radio OK
-#define COL_RED     0xF800u  // radio FAIL
+#define COL_BG       0x1082u  // near-black
+#define COL_TITLE    0xFFFFu  // white
+#define COL_WIFI     0x07FFu  // cyan — WiFi jammer
+#define COL_BLE      0x041Fu  // blue
+#define COL_BT       0xF800u  // red
+#define COL_JAM      0xFC00u  // orange — JAM TIME
+#define COL_ACTIVE   0xFFE0u  // yellow highlight border
+#define COL_GREEN    0x07E0u  // radio OK
+#define COL_RED      0xF800u  // radio FAIL
+#define COL_SPECTRUM 0xC01Fu  // violet — spectrum analyzer
+#define COL_NETSCAN  0x0480u  // teal-green — network scanner
 
 // ---------------------------------------------------------------------------
 // Radio
@@ -89,27 +99,42 @@ RF24 radioB(NRF_CE_B, NRF_CSN_B, SPI_SPEED);
 static uint8_t btSweepA = 2;
 static uint8_t btSweepB = 80;
 
+// Spectrum scanner state (SPECTRUM mode — full screen, with peak hold)
+uint8_t gSpectrum[126]         = {0};
+uint8_t gSpectrumPrev[126]     = {0};
+uint8_t gSpectrumPeak[126]     = {0};
+uint8_t gSpectrumPeakPrev[126] = {0};
+// Spectrum state for NETSCAN combined mode (top-half chart, no peak hold)
+uint8_t gComboSpectrum[126]    = {0};
+uint8_t gComboSpectrumPrev[126]= {0};
+
 // ---------------------------------------------------------------------------
 // Mode
 // ---------------------------------------------------------------------------
-enum Mode { OFF, WIFI, BLUETOOTH, BLE, JAMTIME };
+enum Mode { OFF, WIFI, BLUETOOTH, BLE, JAMTIME, SPECTRUM, NETSCAN };
 Mode currentMode = OFF;
 
 String inputString = "";
 
 Preferences preferences;
+using RadioSelectFn = void (*)();
+
+// Forward declarations
+void drawSpectrumUI();
+void runSpectrum();
+void drawNetScanUI();
+void runNetScan();
 
 // ---------------------------------------------------------------------------
-// UI layout — 4 buttons in a 2×2 grid, landscape 480×320
+// UI layout — 6 buttons in a 2×3 grid, landscape 480×320
 // ---------------------------------------------------------------------------
-//  Title bar : 0  → 39  (40 px tall)
-//  Button row 1 : 40 → 179 (140 px tall)
-//  Button row 2 : 180 → 319 (140 px tall)
-//  Each col 240 px wide → 4 buttons total (2 cols × 2 rows)
-#define TITLE_H   40
-#define BTN_W    240
-#define BTN_H    140
-#define BTN_BORDER 4
+//  Title bar   :   0 →  39  (40 px tall)
+//  Button row 1:  40 → 179 (140 px tall)  — 3 cols × 160 px wide
+//  Button row 2: 180 → 319 (140 px tall)  — 3 cols × 160 px wide
+#define TITLE_H    40
+#define BTN_W     160   // 480 / 3
+#define BTN_H     140   // (320 - 40) / 2
+#define BTN_BORDER  4
 
 struct Button {
   int x, y, w, h;
@@ -118,11 +143,15 @@ struct Button {
   Mode mode;
 };
 
-static const Button buttons[4] = {
-  {0,            TITLE_H,          BTN_W, BTN_H, COL_WIFI, "WIFI 2.4",  WIFI},
-  {BTN_W,        TITLE_H,          BTN_W, BTN_H, COL_BLE,  "BLE",       BLE},
-  {0,            TITLE_H + BTN_H,  BTN_W, BTN_H, COL_BT,   "BLUETOOTH", BLUETOOTH},
-  {BTN_W,        TITLE_H + BTN_H,  BTN_W, BTN_H, COL_JAM,  "JAM TIME",  JAMTIME},
+// Row 1 (y=40,  h=140): WIFI 2.4 | BLE | BLUETOOTH    (160 px each)
+// Row 2 (y=180, h=140): JAM TIME | SPECTRUM | NET SCAN (160 px each)
+static Button buttons[6] = {
+  {0,       TITLE_H,         BTN_W, BTN_H, COL_WIFI,     "WIFI 2.4",  WIFI},
+  {BTN_W,   TITLE_H,         BTN_W, BTN_H, COL_BLE,      "BLE",       BLE},
+  {2*BTN_W, TITLE_H,         BTN_W, BTN_H, COL_BT,       "BLUETOOTH", BLUETOOTH},
+  {0,       TITLE_H + BTN_H, BTN_W, BTN_H, COL_JAM,      "JAM TIME",  JAMTIME},
+  {BTN_W,   TITLE_H + BTN_H, BTN_W, BTN_H, COL_SPECTRUM, "SPECTRUM",  SPECTRUM},
+  {2*BTN_W, TITLE_H + BTN_H, BTN_W, BTN_H, COL_NETSCAN,  "NET SCAN",  NETSCAN},
 };
 
 // ---------------------------------------------------------------------------
@@ -130,8 +159,6 @@ static const Button buttons[4] = {
 // ---------------------------------------------------------------------------
 unsigned long lastTouchMs = 0;
 #define TOUCH_DEBOUNCE_MS 300
-unsigned long lastHealthMs = 0;
-#define HEALTH_CHECK_MS 2000  // re-check radio connectivity every 2s
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -142,12 +169,15 @@ String getModeString(Mode mode) {
     case WIFI:       return "WIFI";
     case BLUETOOTH:  return "BLUETOOTH";
     case BLE:        return "BLE";
-    case JAMTIME:   return "JAMTIME";
+    case JAMTIME:    return "JAMTIME";
+    case SPECTRUM:   return "SPECTRUM";
+    case NETSCAN:    return "NETSCAN";
     default:         return "UNKNOWN";
   }
 }
 
 void saveDefaultMode(Mode mode) {
+  if (mode == SPECTRUM || mode == NETSCAN) return;
   preferences.begin("rfclown", false);
   preferences.putUChar("mode", (uint8_t)mode);
   preferences.end();
@@ -205,14 +235,14 @@ void drawButton(int idx, bool active) {
 void drawUI() {
   gfx->fillScreen(COL_BG);
   drawTitleBar();
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < 6; i++) {
     drawButton(i, buttons[i].mode == currentMode);
   }
 }
 
 // Redraw only the buttons (no full screen clear) to avoid flicker
 void refreshButtons() {
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < 6; i++) {
     drawButton(i, buttons[i].mode == currentMode);
   }
 }
@@ -220,6 +250,18 @@ void refreshButtons() {
 // ---------------------------------------------------------------------------
 // Radio config
 // ---------------------------------------------------------------------------
+void selectRadioA() {
+  spiHSPI.end();
+  delayMicroseconds(50);
+  spiHSPI.begin(NRF_CLK_A, NRF_MISO_A, NRF_MOSI_A, -1);
+}
+
+void selectRadioB() {
+  spiHSPI.end();
+  delayMicroseconds(50);
+  spiHSPI.begin(NRF_CLK_B, NRF_MISO_B, NRF_MOSI_B, -1);
+}
+
 // Noise payload — 32 bytes of random data, refreshed periodically
 uint8_t noisePayload[32];
 
@@ -230,16 +272,18 @@ void refreshNoise() {
 // CW tone on one channel — diagnostic-only. startConstCarrier emits an
 // unmodulated carrier (single frequency, ~0 Hz wide) which does not
 // effectively disrupt wideband OFDM like WiFi. Use spamChannel for jamming.
-void cwOnChannel(RF24 &radio, uint8_t ch) {
+void cwOnChannel(RF24 &radio, RadioSelectFn selectRadio, uint8_t ch) {
+  selectRadio();
   radio.stopConstCarrier();
-  radio.startConstCarrier(RF24_PA_MAX, ch);
+  radio.startConstCarrier(RF24_PA_HIGH, ch);
 }
 
 // Modulated noise burst: transmit N non-ACK packets of random payload on `ch`.
 // At 2 Mbps + 32-byte payload each packet is ~140 µs on-air and occupies
 // ~1-2 MHz of GFSK-modulated bandwidth — looks like real noise to a WiFi/BT
 // receiver, unlike a CW tone.
-void spamChannel(RF24 &radio, uint8_t ch, uint8_t packets = 4) {
+void spamChannel(RF24 &radio, RadioSelectFn selectRadio, uint8_t ch, uint8_t packets = 4) {
+  selectRadio();
   radio.stopConstCarrier();
   radio.setChannel(ch);
   for (uint8_t i = 0; i < packets; i++) {
@@ -248,12 +292,15 @@ void spamChannel(RF24 &radio, uint8_t ch, uint8_t packets = 4) {
   }
 }
 
-bool configureRadio(RF24 &radio) {
+bool configureRadio(RF24 &radio, RadioSelectFn selectRadio) {
+  selectRadio();
   if (radio.begin(&spiHSPI)) {
     radio.setAutoAck(false);
     radio.stopListening();
     radio.setRetries(0, 0);
-    radio.setPALevel(RF24_PA_MAX, true);
+    // PA_HIGH (-6dBm chip out, still huge through PA+LNA) — PA_MAX peak current
+    // sags the shared 3.3V rail enough to brown out the sibling radio.
+    radio.setPALevel(RF24_PA_HIGH, true);
     radio.setDataRate(RF24_2MBPS);
     radio.setCRCLength(RF24_CRC_DISABLED);
     radio.setPayloadSize(32);
@@ -271,11 +318,49 @@ bool configureRadio(RF24 &radio) {
 // Mode control
 // ---------------------------------------------------------------------------
 void activateMode(Mode mode) {
-  // Always silence the carrier on mode change. The new mode (if any) will rekey on its first jam call.
-  if (radioAok) radioA.stopConstCarrier();
-  if (radioBok) radioB.stopConstCarrier();
+  if (radioAok) { selectRadioA(); radioA.stopConstCarrier(); }
+  if (radioBok) { selectRadioB(); radioB.stopConstCarrier(); }
+
+  // Exiting SPECTRUM (radio in RX): restore TX config
+  if (currentMode == SPECTRUM && mode != SPECTRUM) {
+    if (radioAok) configureRadio(radioA, selectRadioA);
+    if (radioBok) configureRadio(radioB, selectRadioB);
+    currentMode = mode;
+    drawUI();
+    return;
+  }
+
+  // Exiting NETSCAN: restore radio TX config and tear down WiFi
+  if (currentMode == NETSCAN && mode != NETSCAN) {
+    if (radioAok) configureRadio(radioA, selectRadioA);
+    if (radioBok) configureRadio(radioB, selectRadioB);
+    esp_wifi_stop();
+    esp_wifi_deinit();
+    currentMode = mode;
+    drawUI();
+    return;
+  }
+
   currentMode = mode;
-  refreshButtons();
+
+  if (mode == SPECTRUM) {
+    memset(gSpectrum,         0, sizeof(gSpectrum));
+    memset(gSpectrumPrev,     0, sizeof(gSpectrumPrev));
+    memset(gSpectrumPeak,     0, sizeof(gSpectrumPeak));
+    memset(gSpectrumPeakPrev, 0, sizeof(gSpectrumPeakPrev));
+    drawSpectrumUI();
+  } else if (mode == NETSCAN) {
+    memset(gComboSpectrum,     0, sizeof(gComboSpectrum));
+    memset(gComboSpectrumPrev, 0, sizeof(gComboSpectrumPrev));
+    // Re-init internal WiFi for non-blocking AP scanning
+    wifi_init_config_t wifiCfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&wifiCfg);
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_start();
+    drawNetScanUI();
+  } else {
+    refreshButtons();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -284,54 +369,53 @@ void activateMode(Mode mode) {
 // 2MBPS + 32-byte payload → each packet occupies ~2 MHz for ~140 µs.
 // ---------------------------------------------------------------------------
 
-// WiFi 2.4 GHz US channel centers: 1=NRF24 ch 2, 6=27, 11=52.
-// Radio A pins a heavy burst on one center; Radio B sweeps the other two.
-// Rotate the primary each call so all three centers get heavy dwell over time.
-static const uint8_t wifiCenters[] = {2, 27, 52};
-static uint8_t wifiPrimaryIdx = 0;
+// WiFi 2.4 GHz — full 20 MHz band coverage around each of the 3 non-overlapping centers.
+// CH1 occupies NRF24 ch 0–12, CH6 ch 21–33, CH11 ch 44–56 (13 channels each).
+// Radio A sweeps the lower half (indices 0–6), Radio B sweeps the upper half (indices 6–12).
+// Each call advances one step so every channel in each band is hit every 7 calls.
+static const uint8_t wifiBandStart[] = {0,  21, 44};
+static const uint8_t wifiBandMid[]   = {6,  27, 50};
+static uint8_t wifiSweepA = 0, wifiSweepB = 0;
 
 void jamWifi() {
-  if (radioAok) spamChannel(radioA, wifiCenters[wifiPrimaryIdx], 15);
-  if (radioBok) {
-    spamChannel(radioB, wifiCenters[(wifiPrimaryIdx + 1) % 3], 8);
-    spamChannel(radioB, wifiCenters[(wifiPrimaryIdx + 2) % 3], 8);
+  for (int b = 0; b < 3; b++) {
+    uint8_t chA = wifiBandStart[b] + (wifiSweepA % 7);
+    uint8_t chB = wifiBandMid[b]   + (wifiSweepB % 7);
+    if (radioAok) spamChannel(radioA, selectRadioA, chA, 8);
+    if (radioBok) spamChannel(radioB, selectRadioB, chB, 8);
   }
-  wifiPrimaryIdx = (wifiPrimaryIdx + 1) % 3;
+  wifiSweepA = (wifiSweepA + 1) % 7;
+  wifiSweepB = (wifiSweepB + 1) % 7;
 }
 
 // BLE: 3 advertising channels (2, 26, 80) + 37 data channels (4–78)
-// Both radios active: one hammers advertising, other sweeps data, then swap
-static uint8_t bleSweepAdv = 0;
-static uint8_t bleSweepData = 4;
+// Radio A hammers ALL 3 adv channels every call (8 pkts each) — no rotation.
+// Radio B sweeps 2 data channels per call stepping by 2 (covers band in ~19 calls).
 static const uint8_t bleAdvCh[] = {2, 26, 80};
-static bool bleSwapRadios = false;  // alternate which radio does what
 
 void jamBLE() {
-  RF24 *advRadio  = bleSwapRadios ? &radioB : &radioA;
-  RF24 *dataRadio = bleSwapRadios ? &radioA : &radioB;
-  bool advOk  = bleSwapRadios ? radioBok : radioAok;
-  bool dataOk = bleSwapRadios ? radioAok : radioBok;
-
-  // Hammer advertising channel — heavy packet burst
-  if (advOk) spamChannel(*advRadio, bleAdvCh[bleSweepAdv], 6);
-  bleSweepAdv = (bleSweepAdv + 1) % 3;
-
-  // Sweep data channels — all 37 BLE data channels (NRF24 ch 4–78)
-  if (dataOk) spamChannel(*dataRadio, bleSweepData, 2);
-  bleSweepData++;
-  if (bleSweepData > 78) {
-    bleSweepData = 4;
-    bleSwapRadios = !bleSwapRadios;  // swap roles each full sweep
+  static uint8_t bleSweepData = 4;
+  if (radioAok) {
+    for (int i = 0; i < 3; i++)
+      spamChannel(radioA, selectRadioA, bleAdvCh[i], 8);
   }
+  if (radioBok) {
+    spamChannel(radioB, selectRadioB, bleSweepData, 4);
+    uint8_t next = (bleSweepData + 1 <= 78) ? bleSweepData + 1 : 4;
+    spamChannel(radioB, selectRadioB, next, 4);
+  }
+  bleSweepData += 2;
+  if (bleSweepData > 78) bleSweepData = 4;
 }
 
 // Classic Bluetooth: 79 channels (NRF24 ch 2–80)
-// Both radios sweep from opposite ends
+// Both radios sweep from opposite ends, stepping by 2 for faster band coverage.
+// 6 packets per channel (was 3) for denser interference per hop slot.
 void jamBluetooth() {
-  if (radioAok) spamChannel(radioA, btSweepA, 3);
-  if (radioBok) spamChannel(radioB, btSweepB, 3);
-  btSweepA = (btSweepA >= 80) ? 2 : btSweepA + 1;
-  btSweepB = (btSweepB <= 2) ? 80 : btSweepB - 1;
+  if (radioAok) spamChannel(radioA, selectRadioA, btSweepA, 6);
+  if (radioBok) spamChannel(radioB, selectRadioB, btSweepB, 6);
+  btSweepA += 2; if (btSweepA > 80) btSweepA = 2;
+  btSweepB  = (btSweepB <= 4) ? 80 : btSweepB - 2;
 }
 
 // ---------------------------------------------------------------------------
@@ -344,19 +428,356 @@ static uint8_t jamSweepA = 0;
 static uint8_t jamSweepB = 125;
 
 void jamAll() {
-  if (radioAok) spamChannel(radioA, jamSweepA, 2);
-  if (radioBok) spamChannel(radioB, jamSweepB, 2);
+  if (radioAok) spamChannel(radioA, selectRadioA, jamSweepA, 5);
+  if (radioBok) spamChannel(radioB, selectRadioB, jamSweepB, 5);
   jamSweepA = (jamSweepA + 1) % 126;
   jamSweepB = (jamSweepB == 0) ? 125 : jamSweepB - 1;
 }
 
+// ---------------------------------------------------------------------------
+// SPECTRUM mode — full-screen NRF24 RPD sweep with yellow peak-hold markers
+// Back button in title bar: tap x=0-64, y=0-39 to return to main menu.
+// ---------------------------------------------------------------------------
+
+static void drawBackButton() {
+  gfx->drawRect(2, 5, 62, 28, COL_ACTIVE);
+  gfx->setTextColor(COL_ACTIVE);
+  gfx->setTextSize(1);
+  gfx->setCursor(7, 14);
+  gfx->print("< HOME");
+}
+
+void drawSpectrumUI() {
+  gfx->fillScreen(COL_BG);
+
+  // Title bar
+  gfx->fillRect(0, 0, 480, TITLE_H, COL_BG);
+  drawBackButton();
+  gfx->setTextColor(COL_TITLE);
+  gfx->setTextSize(2);
+  const char *label = "SPECTRUM";
+  int tw = strlen(label) * 12;
+  gfx->setCursor((480 - tw) / 2, (TITLE_H - 16) / 2);
+  gfx->print(label);
+  // Peak-hold legend (left of dots)
+  gfx->setTextColor(COL_ACTIVE);
+  gfx->setTextSize(1);
+  gfx->setCursor(374, 10);
+  gfx->print("PEAK");
+  gfx->drawFastHLine(374, 20, 24, COL_ACTIVE);  // sample tick
+  drawStatusDots();
+
+  // Frequency axis labels
+  gfx->setTextSize(1);
+  gfx->setTextColor(COL_TITLE);
+  gfx->setCursor(0,   302); gfx->print("2400");
+  gfx->setCursor(440, 302); gfx->print("2525");
+  gfx->setTextColor(COL_WIFI);
+  gfx->setCursor((2  * 480) / 126, 302); gfx->print("W1");
+  gfx->setCursor((27 * 480) / 126, 302); gfx->print("W6");
+  gfx->setCursor((52 * 480) / 126, 302); gfx->print("W11");
+  gfx->setTextColor(COL_BLE);
+  gfx->setCursor((26 * 480) / 126, 310); gfx->print("B38");
+  gfx->setCursor((80 * 480) / 126, 310); gfx->print("B39");
+  static const uint8_t bleAdvNRF[] = {2, 26, 80};
+  for (int i = 0; i < 3; i++) {
+    gfx->drawFastVLine((bleAdvNRF[i] * 480) / 126, 295, 4, COL_BLE);
+  }
+}
+
+void updateSpectrumBar(uint8_t ch) {
+  const int chartTop = 40;
+  const int chartBot = 299;
+  const int chartH   = chartBot - chartTop;
+
+  int bx  = ((int)ch * 480) / 126;
+  int bw  = (((int)ch + 1) * 480) / 126 - bx;
+  if (bw < 1) bw = 1;
+
+  bool isBleAdv = (ch == 2 || ch == 26 || ch == 80);
+  bool isWifi   = (ch <= 12) || (ch >= 21 && ch <= 33) || (ch >= 44 && ch <= 56);
+  uint16_t col  = isBleAdv ? COL_BLE : (isWifi ? COL_WIFI : COL_GREEN);
+
+  // --- Bar (same proven logic as old updateScanBar) ---
+  int barH  = ((int)gSpectrum[ch]     * chartH) / 63;
+  int prevH = ((int)gSpectrumPrev[ch] * chartH) / 63;
+  if (barH != prevH) {
+    if (barH > prevH)
+      gfx->fillRect(bx, chartBot - barH, bw, barH - prevH, col);
+    else
+      gfx->fillRect(bx, chartBot - prevH, bw, prevH - barH, COL_BG);
+    gSpectrumPrev[ch] = gSpectrum[ch];
+  }
+
+  // --- Peak hold (only touches pixels strictly above the bar) ---
+  uint8_t oldPeak = gSpectrumPeak[ch];
+  if (gSpectrum[ch] >= gSpectrumPeak[ch])
+    gSpectrumPeak[ch] = gSpectrum[ch];
+  else if (gSpectrumPeak[ch] > 0)
+    gSpectrumPeak[ch]--;
+
+  if (oldPeak != gSpectrumPeak[ch]) {
+    int oldPH = ((int)oldPeak           * chartH) / 63;
+    int newPH = ((int)gSpectrumPeak[ch] * chartH) / 63;
+    if (oldPH > barH && oldPH > 0)
+      gfx->drawFastHLine(bx, chartBot - oldPH, bw, COL_BG);
+    if (newPH > barH && newPH > 0)
+      gfx->drawFastHLine(bx, chartBot - newPH, bw, COL_ACTIVE);
+  }
+}
+
+void runSpectrum() {
+  RF24 *scanRadio     = radioAok ? &radioA      : (radioBok ? &radioB      : nullptr);
+  RadioSelectFn selFn = radioAok ? selectRadioA : (radioBok ? selectRadioB : nullptr);
+  if (!scanRadio) return;
+
+  selFn();
+  for (uint8_t ch = 0; ch < 126; ch++) {
+    scanRadio->setChannel(ch);
+    scanRadio->startListening();
+    delayMicroseconds(200);
+    bool hit = scanRadio->testRPD();
+    scanRadio->stopListening();
+    if (hit)
+      gSpectrum[ch] = 63;
+    else
+      gSpectrum[ch] = (gSpectrum[ch] > 3) ? gSpectrum[ch] - 3 : 0;
+    updateSpectrumBar(ch);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// NETSCAN mode — combined view: NRF24 spectrum (top) + 802.11 AP list (bottom)
+// The NRF24 sweep and internal WiFi scan run concurrently (independent hardware).
+// WiFi scan is non-blocking to keep spectrum live during the scan.
+// Back button: tap x=0-64, y=0-39 to return to main menu.
+// ---------------------------------------------------------------------------
+
+struct APRecord {
+  char    ssid[33];
+  int8_t  rssi;
+  uint8_t channel;
+  uint8_t auth;
+};
+
+static APRecord apRecords[20];
+static uint16_t apCount           = 0;
+static unsigned long lastNetScanMs = 0;
+static bool      wifiScanPending   = false;
+static unsigned long wifiScanStartMs = 0;
+#define NET_SCAN_INTERVAL_MS  10000  // start a new scan every 10 s
+#define WIFI_SCAN_SETTLE_MS    4000  // wait 4 s after non-blocking start before reading
+
+// Spectrum chart occupies the top half: y=40-178 (138 px)
+#define COMBO_CHART_TOP   40
+#define COMBO_CHART_BOT  178
+
+static const char *authLabel(uint8_t auth) {
+  switch (auth) {
+    case WIFI_AUTH_OPEN:         return "OPEN";
+    case WIFI_AUTH_WEP:          return "WEP";
+    case WIFI_AUTH_WPA_PSK:      return "WPA";
+    case WIFI_AUTH_WPA2_PSK:     return "WPA2";
+    case WIFI_AUTH_WPA_WPA2_PSK: return "WPA+";
+    case WIFI_AUTH_WPA3_PSK:     return "WPA3";
+    default:                      return "OTH";
+  }
+}
+
+void drawNetScanUI() {
+  gfx->fillScreen(COL_BG);
+
+  // Title bar
+  gfx->fillRect(0, 0, 480, TITLE_H, COL_BG);
+  drawBackButton();
+  gfx->setTextColor(COL_TITLE);
+  gfx->setTextSize(2);
+  const char *title = "RF RECON";
+  int tw = strlen(title) * 12;
+  gfx->setCursor((480 - tw) / 2, (TITLE_H - 16) / 2);
+  gfx->print(title);
+  drawStatusDots();
+
+  // Spectrum axis labels
+  gfx->setTextSize(1);
+  gfx->setTextColor(COL_TITLE);
+  gfx->setCursor(0,   170); gfx->print("2400");
+  gfx->setCursor(440, 170); gfx->print("2525");
+  gfx->setTextColor(COL_WIFI);
+  gfx->setCursor((2  * 480) / 126, 170); gfx->print("W1");
+  gfx->setCursor((27 * 480) / 126, 170); gfx->print("W6");
+  gfx->setCursor((52 * 480) / 126, 170); gfx->print("W11");
+
+  // Divider between spectrum and network panel
+  gfx->drawFastHLine(0, COMBO_CHART_BOT + 1, 480, 0x4208);
+
+  // Network panel header
+  gfx->setTextColor(0x8410);
+  gfx->setCursor(2,   182); gfx->print("SSID");
+  gfx->setCursor(256, 182); gfx->print("CH");
+  gfx->setCursor(292, 182); gfx->print("RSSI");
+  gfx->setCursor(360, 182); gfx->print("AUTH");
+  gfx->drawFastHLine(0, 191, 480, 0x2104);
+
+  // Initial scanning placeholder
+  gfx->setTextColor(0x4208);
+  gfx->setTextSize(1);
+  gfx->setCursor(190, 255);
+  gfx->print("Scanning...");
+}
+
+void updateComboSpectrumBar(uint8_t ch) {
+  const int chartH = COMBO_CHART_BOT - COMBO_CHART_TOP;
+
+  int bx  = ((int)ch * 480) / 126;
+  int bx2 = (((int)ch + 1) * 480) / 126;
+  int bw  = (bx2 > bx) ? bx2 - bx : 1;
+
+  int barH  = ((int)gComboSpectrum[ch]     * chartH) / 63;
+  int prevH = ((int)gComboSpectrumPrev[ch] * chartH) / 63;
+  if (barH == prevH) return;
+
+  bool isBleAdv = (ch == 2 || ch == 26 || ch == 80);
+  bool isWifi   = (ch <= 12) || (ch >= 21 && ch <= 33) || (ch >= 44 && ch <= 56);
+  uint16_t col  = isBleAdv ? COL_BLE : (isWifi ? COL_WIFI : COL_GREEN);
+
+  if (barH > prevH)
+    gfx->fillRect(bx, COMBO_CHART_BOT - barH, bw, barH - prevH, col);
+  else
+    gfx->fillRect(bx, COMBO_CHART_BOT - prevH, bw, prevH - barH, COL_BG);
+
+  gComboSpectrumPrev[ch] = gComboSpectrum[ch];
+}
+
+void drawNetworkPanel() {
+  gfx->fillRect(0, 192, 480, 127, COL_BG);  // clear data rows
+
+  if (apCount == 0) {
+    gfx->setTextColor(COL_RED);
+    gfx->setTextSize(1);
+    gfx->setCursor(190, 250);
+    gfx->print("No networks");
+    return;
+  }
+
+  // Sort by RSSI descending
+  for (int i = 0; i < (int)apCount - 1; i++)
+    for (int j = 0; j < (int)apCount - 1 - i; j++)
+      if (apRecords[j].rssi < apRecords[j+1].rssi) {
+        APRecord tmp = apRecords[j]; apRecords[j] = apRecords[j+1]; apRecords[j+1] = tmp;
+      }
+
+  int show = (apCount > 6) ? 6 : (int)apCount;
+  gfx->setTextSize(1);
+
+  for (int i = 0; i < show; i++) {
+    int y = 193 + i * 20;
+    int8_t rssi = apRecords[i].rssi;
+    uint16_t col = (rssi >= -60) ? COL_GREEN : (rssi >= -75) ? COL_ACTIVE : COL_RED;
+
+    // Signal bars
+    int bars = (rssi >= -55) ? 5 : (rssi >= -65) ? 4 : (rssi >= -75) ? 3 : (rssi >= -85) ? 2 : 1;
+    for (int b = 0; b < 5; b++)
+      gfx->fillRect(2 + b * 8, y + 4, 6, 10, (b < bars) ? col : (uint16_t)0x2104);
+
+    // SSID (truncate to 22 chars)
+    char ssid[23];
+    strncpy(ssid, apRecords[i].ssid, 22); ssid[22] = '\0';
+    if (strlen(apRecords[i].ssid) > 22) { ssid[20] = '.'; ssid[21] = '.'; }
+    gfx->setTextColor(col);
+    gfx->setCursor(46, y + 5); gfx->print(ssid);
+
+    char tmp[12];
+    sprintf(tmp, "%2d", apRecords[i].channel);
+    gfx->setCursor(258, y + 5); gfx->print(tmp);
+
+    sprintf(tmp, "%4ddBm", rssi);
+    gfx->setCursor(280, y + 5); gfx->print(tmp);
+
+    gfx->setCursor(360, y + 5); gfx->print(authLabel(apRecords[i].auth));
+  }
+
+  // Status line
+  char status[48];
+  sprintf(status, "%d network%s | refresh 10s", (int)apCount, apCount == 1 ? "" : "s");
+  gfx->setTextColor(0x4208);
+  gfx->setCursor(2, 313);
+  gfx->print(status);
+}
+
+void runNetScan() {
+  // ---- NRF24 spectrum sweep (top half, always running) ----
+  RF24 *scanRadio     = radioAok ? &radioA      : (radioBok ? &radioB      : nullptr);
+  RadioSelectFn selFn = radioAok ? selectRadioA : (radioBok ? selectRadioB : nullptr);
+  if (scanRadio) {
+    selFn();
+    for (uint8_t ch = 0; ch < 126; ch++) {
+      scanRadio->setChannel(ch);
+      scanRadio->startListening();
+      delayMicroseconds(200);
+      bool hit = scanRadio->testRPD();
+      scanRadio->stopListening();
+      if (hit)
+        gComboSpectrum[ch] = 63;
+      else
+        gComboSpectrum[ch] = (gComboSpectrum[ch] > 3) ? gComboSpectrum[ch] - 3 : 0;
+      updateComboSpectrumBar(ch);
+    }
+  }
+
+  // ---- Non-blocking WiFi scan (bottom half, periodic) ----
+  unsigned long now = millis();
+
+  if (!wifiScanPending && now - lastNetScanMs >= NET_SCAN_INTERVAL_MS) {
+    wifi_scan_config_t sc = {};
+    sc.show_hidden  = 1;
+    sc.scan_type    = WIFI_SCAN_TYPE_ACTIVE;
+    sc.scan_time.active.min = 50;
+    sc.scan_time.active.max = 100;
+    esp_wifi_scan_start(&sc, false);  // non-blocking — NRF24 sweep continues
+    wifiScanPending  = true;
+    wifiScanStartMs  = now;
+    // Show scanning indicator
+    gfx->setTextColor(0x4208);
+    gfx->setTextSize(1);
+    gfx->fillRect(0, 310, 200, 9, COL_BG);
+    gfx->setCursor(2, 313); gfx->print("Scanning...");
+  }
+
+  if (wifiScanPending && now - wifiScanStartMs >= WIFI_SCAN_SETTLE_MS) {
+    uint16_t count = 0;
+    esp_wifi_scan_get_ap_num(&count);
+    if (count > 20) count = 20;
+    wifi_ap_record_t *recs = (wifi_ap_record_t*)malloc(count * sizeof(wifi_ap_record_t));
+    if (recs) {
+      esp_wifi_scan_get_ap_records(&count, recs);
+      apCount = count;
+      for (int i = 0; i < (int)count; i++) {
+        strncpy(apRecords[i].ssid, (char*)recs[i].ssid, 32);
+        apRecords[i].ssid[32] = '\0';
+        apRecords[i].rssi    = recs[i].rssi;
+        apRecords[i].channel = recs[i].primary;
+        apRecords[i].auth    = recs[i].authmode;
+      }
+      free(recs);
+    }
+    wifiScanPending = false;
+    lastNetScanMs   = now;
+    drawNetworkPanel();
+  }
+}
+
+// ---------------------------------------------------------------------------
+
 void executeMode() {
   switch (currentMode) {
-    case OFF:        delay(100);    break;
-    case WIFI:       jamWifi();     break;
-    case BLE:        jamBLE();      break;
-    case BLUETOOTH:  jamBluetooth(); break;
-    case JAMTIME:    jamAll();      break;
+    case OFF:        delay(50);       break;
+    case WIFI:       jamWifi();       break;
+    case BLE:        jamBLE();        break;
+    case BLUETOOTH:  jamBluetooth();  break;
+    case JAMTIME:    jamAll();        break;
+    case SPECTRUM:   runSpectrum();   break;
+    case NETSCAN:    runNetScan();    break;
   }
 }
 
@@ -399,7 +820,14 @@ void handleTouch() {
 
   lastTouchMs = now;
 
-  for (int i = 0; i < 4; i++) {
+  // Full-screen modes: only the < HOME button exits
+  if (currentMode == SPECTRUM || currentMode == NETSCAN) {
+    if (tx < 65 && ty < TITLE_H)
+      activateMode(OFF);
+    return;
+  }
+
+  for (int i = 0; i < 6; i++) {
     const Button &b = buttons[i];
     if (tx >= b.x && tx < b.x + b.w && ty >= b.y && ty < b.y + b.h) {
       if (buttons[i].mode == currentMode) {
@@ -426,6 +854,8 @@ void handleCommand() {
   else if (inputString == "mode:bluetooth")    { activateMode(BLUETOOTH); }
   else if (inputString == "mode:ble")          { activateMode(BLE); }
   else if (inputString == "mode:jamtime")      { activateMode(JAMTIME); }
+  else if (inputString == "mode:spectrum")     { activateMode(SPECTRUM); }
+  else if (inputString == "mode:netscan")      { activateMode(NETSCAN); }
   else if (inputString == "default:off")       { saveDefaultMode(OFF); }
   else if (inputString == "default:wifi")      { saveDefaultMode(WIFI); }
   else if (inputString == "default:bluetooth") { saveDefaultMode(BLUETOOTH); }
@@ -435,7 +865,7 @@ void handleCommand() {
     int ch = inputString.substring(5).toInt();
     if (ch >= 0 && ch <= 125) {
       activateMode(OFF);
-      if (radioAok) cwOnChannel(radioA, (uint8_t)ch);
+      if (radioAok) cwOnChannel(radioA, selectRadioA, (uint8_t)ch);
       Serial.printf("DIAG: Radio A CW on ch %d (%d MHz)\n", ch, 2400 + ch);
     }
   }
@@ -443,7 +873,7 @@ void handleCommand() {
     int ch = inputString.substring(6).toInt();
     if (ch >= 0 && ch <= 125) {
       activateMode(OFF);
-      if (radioBok) cwOnChannel(radioB, (uint8_t)ch);
+      if (radioBok) cwOnChannel(radioB, selectRadioB, (uint8_t)ch);
       Serial.printf("DIAG: Radio B CW on ch %d (%d MHz)\n", ch, 2400 + ch);
     }
   }
@@ -562,39 +992,22 @@ void setup() {
   esp_wifi_deinit();
   esp_wifi_disconnect();
 
-  // NRF24 SPI bus — HSPI shared by both radios (split grey/yellow/purple wires)
-  spiHSPI.begin(NRF_CLK, NRF_MISO, NRF_MOSI, -1);
-
-  Serial.println("Initializing Radio A (CE=" + String(NRF_CE_A) + " CSN=" + String(NRF_CSN_A) + ")...");
-  radioAok = configureRadio(radioA);  // Radio A
+  Serial.println("Initializing Radio A (CE=" + String(NRF_CE_A) + " CSN=" + String(NRF_CSN_A) +
+                 " SCK=" + String(NRF_CLK_A) + " MOSI=" + String(NRF_MOSI_A) +
+                 " MISO=" + String(NRF_MISO_A) + ")...");
+  radioAok = configureRadio(radioA, selectRadioA);
   Serial.println("Radio A: " + String(radioAok ? "OK" : "FAIL"));
   delay(10);
-  Serial.println("Initializing Radio B (CE=" + String(NRF_CE_B) + " CSN=" + String(NRF_CSN_B) + ")...");
-  radioBok = configureRadio(radioB);  // Radio B
+  Serial.println("Initializing Radio B (CE=" + String(NRF_CE_B) + " CSN=" + String(NRF_CSN_B) +
+                 " SCK=" + String(NRF_CLK_B) + " MOSI=" + String(NRF_MOSI_B) +
+                 " MISO=" + String(NRF_MISO_B) + ")...");
+  radioBok = configureRadio(radioB, selectRadioB);
   Serial.println("Radio B: " + String(radioBok ? "OK" : "FAIL"));
   drawUI();  // redraw to update status dots
 
   Serial.println("The Gizmo — Waveshare ESP32-S3-Touch-LCD-3.5-C");
   Serial.println("Mode: " + getModeString(currentMode));
   sendCurrentMode();
-}
-
-// ---------------------------------------------------------------------------
-// Radio health check — periodic re-verification
-// ---------------------------------------------------------------------------
-void checkRadioHealth() {
-  unsigned long now = millis();
-  if (now - lastHealthMs < HEALTH_CHECK_MS) return;
-  lastHealthMs = now;
-
-  bool prevA = radioAok;
-  bool prevB = radioBok;
-  radioAok = radioA.isChipConnected();
-  radioBok = radioB.isChipConnected();
-
-  if (radioAok != prevA || radioBok != prevB) {
-    drawStatusDots();
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -605,7 +1018,6 @@ void serialEvent();  // forward decl — defined below
 void loop() {
   handleTouch();
   executeMode();
-  checkRadioHealth();
   serialEvent();  // ESP32 Arduino doesn't auto-call this; do it explicitly
 }
 
@@ -622,4 +1034,3 @@ void serialEvent() {
     }
   }
 }
-
