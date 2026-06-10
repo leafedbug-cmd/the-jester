@@ -10,6 +10,8 @@ enum class JammerMode : uint8_t {
     Bluetooth = 0,
     Ble,
     Wifi,
+    WifiLock,
+    Adaptive,
     All,
     Off,
 };
@@ -78,6 +80,10 @@ private:
     bool _trustMode = false;
     unsigned long _lastHealthCheckMs = 0;
     unsigned long _lastRecoveryAttemptMs = 0;
+    unsigned long _lastWifiLockHopMs = 0;
+    uint8_t _wifiLockSet = 0;  // which WiFi channel (CH1/6/11) is locked now
+    unsigned long _lastAdaptiveScanMs = 0;
+    uint8_t _adaptiveChannels[kNRF24RadioCount] = {0};  // busiest channels found
 
     portMUX_TYPE _stateMux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -88,6 +94,9 @@ private:
     void _setLedColor(uint8_t red, uint8_t green, uint8_t blue);
     void _setChannelInternal(NRF24L01& radio, uint8_t& currentChannel, uint8_t channel);
     void _configureAggressiveMode(NRF24L01& radio);
+    void _activateRadioForMode(uint8_t index);
+    void _performAdaptiveScan();
+    void _pickBusiestChannels(const uint8_t* busyPercent, uint8_t* out, uint8_t count);
     void _startJammingForCurrentMode();
     void _stopJamming();
     void _runBurstForMode();

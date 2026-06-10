@@ -195,6 +195,15 @@ void NRF24L01::transmit() {
     setCELow();
 }
 
+void NRF24L01::startConstantCarrier(uint8_t channel) {
+    powerUp();
+    setTxMode();
+    // RF_SETUP: CONT_WAVE (0x80) | PLL_LOCK (0x10) | RF_PWR max (0x06)
+    writeRegister(0x06, 0x96);
+    setChannel(channel);
+    setCEHigh();  // hold CE high -> carrier transmits continuously
+}
+
 void NRF24L01::activateBus() {
     if (!_busStarted) {
         _spi->begin(_sckPin, _misoPin, _mosiPin, -1);

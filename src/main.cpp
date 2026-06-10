@@ -9,7 +9,7 @@
 namespace {
 constexpr int8_t  kLedPin        = 48;
 constexpr uint8_t kBootButtonPin = 0;
-constexpr uint8_t kModeCount     = 5;
+constexpr uint8_t kModeCount     = 7;
 
 // Shared SPI bus — one wire from each of these pins fans out to all radios.
 constexpr uint8_t kRadioSckPin  = 12;
@@ -68,6 +68,8 @@ void setLedForMode(JammerMode mode) {
         case JammerMode::Bluetooth: neopixelWrite(kLedPin,   0,   0, 255); break; // blue
         case JammerMode::Ble:       neopixelWrite(kLedPin, 255,  20, 147); break; // pink
         case JammerMode::Wifi:      neopixelWrite(kLedPin,   0, 255,   0); break; // green
+        case JammerMode::WifiLock:  neopixelWrite(kLedPin,   0, 255, 255); break; // cyan
+        case JammerMode::Adaptive:  neopixelWrite(kLedPin, 255, 255, 255); break; // white
         case JammerMode::All: {
             uint8_t r, g, b;
             hsvToRgb(gPartyHue, r, g, b);

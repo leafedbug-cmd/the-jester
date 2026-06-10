@@ -40,6 +40,10 @@ public:
     void writeTxPayload(const uint8_t* data, uint8_t len);
     void transmit();
 
+    // Emit a continuous unmodulated carrier on `channel` at max power (100%
+    // duty cycle). CE is held high; call powerDown()/setCELow() to stop.
+    void startConstantCarrier(uint8_t channel);
+
 private:
     SPIClass* _spi = nullptr;
     uint8_t _cePin = 0;

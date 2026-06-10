@@ -10,8 +10,17 @@ constexpr unsigned long kRecoveryAttemptIntervalMs = 500;
 
 constexpr uint8_t kBluetoothChannels[] = {32, 34, 46, 48, 50, 52, 0, 1, 2, 4, 6, 8, 22, 24, 26, 28, 30, 74, 76, 78, 80};
 constexpr uint8_t kBleChannels[]       = {2, 26, 80};
-// 2.4GHz WiFi CH1-13 mapped to nRF24 RF channel numbers (2400 + ch_mhz_center - 2400)
-constexpr uint8_t kWifiChannels[]      = {2, 7, 12, 17, 22, 27, 32, 37, 42, 47, 52, 57, 62};
+// WiFi-Lock: nRF center channel for non-overlapping WiFi CH1/6/11
+// (2412/2437/2462 MHz -> nRF ch 12/37/62). Three carriers are spread across
+// each 20 MHz channel using kWifiLockSpread offsets.
+constexpr uint8_t kWifiLockCenters[]   = {12, 37, 62};
+constexpr int8_t  kWifiLockSpread[]    = {-8, 0, +8};  // ~20 MHz coverage per channel
+constexpr unsigned long kWifiLockDwellMs = 250;        // time parked on each channel
+
+// Adaptive mode: scan the band, carrier-jam the busiest channels, repeat.
+constexpr int kAdaptiveScanSamples = 25;               // RPD samples/channel (~0.6s scan)
+constexpr unsigned long kAdaptiveJamMs = 6000;         // jam duration before re-scanning
+constexpr uint8_t kAdaptiveSeparation = 8;             // min channel gap between picks
 
 // Full 2.4GHz sweep counter — radios walk the whole band offset by even slices
 static uint8_t sAllSweepPos = 0;
@@ -22,6 +31,8 @@ const char* jammerModeName(JammerMode mode) {
         case JammerMode::Bluetooth: return "BLUETOOTH";
         case JammerMode::Ble:       return "BLE";
         case JammerMode::Wifi:      return "WIFI";
+        case JammerMode::WifiLock:  return "WIFI-LOCK";
+        case JammerMode::Adaptive:  return "ADAPTIVE";
         case JammerMode::All:       return "ALL";
         case JammerMode::Off:       return "OFF";
         default:                    return "UNKNOWN";
@@ -40,10 +51,12 @@ ESP32NRF24Jammer::ESP32NRF24Jammer(int8_t ledPin, const NRF24RadioConfig (&radio
 }
 
 void ESP32NRF24Jammer::_idleAllChipSelects() {
-    // Park every module deselected (CSN high) so a not-yet-probed radio with a
-    // floating CSN can't drive the shared MISO line while we talk to another.
+    // Park not-yet-up modules deselected (CSN high) so a floating CSN can't
+    // drive the shared MISO line while we probe another. Skip radios that are
+    // already up — their CSN is managed, and dropping CE here would interrupt
+    // a constant-carrier transmit (BLE mode).
     for (uint8_t i = 0; i < kNRF24RadioCount; ++i) {
-        if (_radioConfigs[i].spi != nullptr) {
+        if (_radioConfigs[i].spi != nullptr && !_radioReady[i]) {
             _radios[i].deselect();
         }
     }
@@ -240,10 +253,9 @@ void ESP32NRF24Jammer::_recoverMissingRadios() {
                 _radioReady[i] = true;
                 recoveredAny = true;
                 // If we're already mid-jam, bring the freshly-found radio
-                // straight into the active burst.
+                // straight into the active mode (burst hop, or BLE carrier).
                 if (_isJamming && _mode != JammerMode::Off) {
-                    _configureAggressiveMode(_radios[i]);
-                    _radios[i].powerUp();
+                    _activateRadioForMode(i);
                 }
                 Serial.printf("[nRF24-%u] Radio reconnected on attempt %u (jamming=%s)\n",
                     i + 1, attempt, _isJamming ? "yes" : "no");
@@ -288,16 +300,111 @@ void ESP32NRF24Jammer::_configureAggressiveMode(NRF24L01& radio) {
     radio.setTxMode();
 }
 
+void ESP32NRF24Jammer::_activateRadioForMode(uint8_t index) {
+    if (_mode == JammerMode::Ble) {
+        // BLE has exactly 3 advertising channels (nRF ch 2/26/80) and we have
+        // up to 3 radios: park each radio on one of them as a continuous
+        // carrier, so all advertising channels are jammed 100% of the time.
+        const uint8_t ch = kBleChannels[index % sizeof(kBleChannels)];
+        _radios[index].startConstantCarrier(ch);
+    } else if (_mode == JammerMode::WifiLock) {
+        // Spread the radios as continuous carriers across the currently-locked
+        // 20 MHz WiFi channel (CH1/6/11), e.g. center -8/0/+8. Rotation through
+        // the three channels happens in _runBurstForMode.
+        const uint8_t center = kWifiLockCenters[_wifiLockSet % sizeof(kWifiLockCenters)];
+        const int8_t  offset = kWifiLockSpread[index % (sizeof(kWifiLockSpread) / sizeof(kWifiLockSpread[0]))];
+        int16_t ch = static_cast<int16_t>(center) + offset;
+        if (ch < 0)   ch = 0;
+        if (ch > 125) ch = 125;
+        _radios[index].startConstantCarrier(static_cast<uint8_t>(ch));
+    } else if (_mode == JammerMode::Adaptive) {
+        // Carrier-jam the busiest channel found for this radio's slot.
+        _radios[index].startConstantCarrier(_adaptiveChannels[index % kNRF24RadioCount]);
+    } else {
+        // Other modes burst-hop; make sure any prior carrier CE is dropped.
+        _radios[index].setCELow();
+        _configureAggressiveMode(_radios[index]);
+        _radios[index].powerUp();
+    }
+}
+
+void ESP32NRF24Jammer::_pickBusiestChannels(const uint8_t* busyPercent, uint8_t* out, uint8_t count) {
+    bool blocked[126] = {false};
+    uint8_t picksFound = 0;
+
+    for (uint8_t n = 0; n < count; ++n) {
+        int bestCh = -1;
+        uint8_t bestVal = 0;
+        for (int ch = 0; ch < 126; ++ch) {
+            if (blocked[ch]) {
+                continue;
+            }
+            if (bestCh < 0 || busyPercent[ch] > bestVal) {
+                bestVal = busyPercent[ch];
+                bestCh = ch;
+            }
+        }
+        if (bestCh < 0 || bestVal == 0) {
+            break;  // nothing meaningful left; fall back below
+        }
+        out[n] = static_cast<uint8_t>(bestCh);
+        ++picksFound;
+        // Block a guard band so the next pick is a distinct busy region, not an
+        // adjacent channel of the same signal.
+        const int lo = bestCh - kAdaptiveSeparation;
+        const int hi = bestCh + kAdaptiveSeparation;
+        for (int g = (lo < 0 ? 0 : lo); g <= (hi > 125 ? 125 : hi); ++g) {
+            blocked[g] = true;
+        }
+    }
+
+    // Fallback for a quiet band: spread the unfilled slots across WiFi 1/6/11.
+    for (uint8_t n = picksFound; n < count; ++n) {
+        out[n] = kWifiLockCenters[n % sizeof(kWifiLockCenters)];
+    }
+}
+
+void ESP32NRF24Jammer::_performAdaptiveScan() {
+    // Silence our own carriers first, or the scan would just hear us.
+    for (uint8_t i = 0; i < kNRF24RadioCount; ++i) {
+        if (_radioReady[i]) {
+            _radios[i].powerDown();
+            _radios[i].setCELow();
+        }
+    }
+
+    int scanner = -1;
+    for (uint8_t i = 0; i < kNRF24RadioCount; ++i) {
+        if (_radioReady[i]) { scanner = i; break; }
+    }
+    if (scanner < 0) {
+        _lastAdaptiveScanMs = millis();
+        return;
+    }
+
+    static uint8_t busyPercent[126];
+    _radios[scanner].scanAllChannels(busyPercent, kAdaptiveScanSamples);
+    _pickBusiestChannels(busyPercent, _adaptiveChannels, kNRF24RadioCount);
+
+    Serial.printf("[ADAPT] busiest channels -> %u, %u, %u\n",
+        _adaptiveChannels[0], _adaptiveChannels[1], _adaptiveChannels[2]);
+    _lastAdaptiveScanMs = millis();
+}
+
 void ESP32NRF24Jammer::_startJammingForCurrentMode() {
     if (!isRadioReady()) {
         _isJamming = false;
         return;
     }
 
+    // Adaptive needs its target channels chosen before carriers come up.
+    if (_mode == JammerMode::Adaptive) {
+        _performAdaptiveScan();
+    }
+
     for (uint8_t i = 0; i < kNRF24RadioCount; ++i) {
         if (_radioReady[i]) {
-            _configureAggressiveMode(_radios[i]);
-            _radios[i].powerUp();
+            _activateRadioForMode(i);
         }
     }
 
@@ -309,6 +416,7 @@ void ESP32NRF24Jammer::_stopJamming() {
         for (uint8_t i = 0; i < kNRF24RadioCount; ++i) {
             if (_radioReady[i]) {
                 _radios[i].powerDown();
+                _radios[i].setCELow();  // stop any constant carrier
             }
         }
         _isJamming = false;
@@ -316,6 +424,41 @@ void ESP32NRF24Jammer::_stopJamming() {
 }
 
 void ESP32NRF24Jammer::_runBurstForMode() {
+    // BLE runs as a continuous carrier set up in _activateRadioForMode — the
+    // radios transmit on their own, so there's no per-loop burst work to do.
+    if (_mode == JammerMode::Ble) {
+        return;
+    }
+
+    // WiFi-Lock also runs as continuous carriers, but rotates the 3-carrier set
+    // across WiFi CH1/6/11 on a dwell timer so all common channels get hit.
+    if (_mode == JammerMode::WifiLock) {
+        if ((millis() - _lastWifiLockHopMs) >= kWifiLockDwellMs) {
+            _lastWifiLockHopMs = millis();
+            _wifiLockSet = (_wifiLockSet + 1) % (sizeof(kWifiLockCenters));
+            for (uint8_t i = 0; i < kNRF24RadioCount; ++i) {
+                if (_radioReady[i]) {
+                    _activateRadioForMode(i);  // retune carrier to the new channel
+                }
+            }
+        }
+        return;
+    }
+
+    // Adaptive: carriers hold on the busiest channels; periodically pause,
+    // re-scan, and retarget so it chases whatever's actually active.
+    if (_mode == JammerMode::Adaptive) {
+        if ((millis() - _lastAdaptiveScanMs) >= kAdaptiveJamMs) {
+            _performAdaptiveScan();  // stops carriers, scans, repicks (resets timer)
+            for (uint8_t i = 0; i < kNRF24RadioCount; ++i) {
+                if (_radioReady[i]) {
+                    _activateRadioForMode(i);  // re-arm carriers on new targets
+                }
+            }
+        }
+        return;
+    }
+
     // One distinct noise buffer per radio so co-located modules don't
     // transmit identical bit patterns.
     static uint8_t radioNoise[kNRF24RadioCount][32] = {
@@ -346,30 +489,39 @@ void ESP32NRF24Jammer::_runBurstForMode() {
     for (size_t burst = 0; burst < kBurstLen; ++burst) {
         const uint8_t b = static_cast<uint8_t>(burst);
 
-        if (_mode == JammerMode::Bluetooth || _mode == JammerMode::Ble || _mode == JammerMode::Wifi) {
-            const uint8_t* channels = kBluetoothChannels;
-            size_t channelCount = sizeof(kBluetoothChannels);
-            if (_mode == JammerMode::Ble) {
-                channels = kBleChannels;
-                channelCount = sizeof(kBleChannels);
-            } else if (_mode == JammerMode::Wifi) {
-                channels = kWifiChannels;
-                channelCount = sizeof(kWifiChannels);
-            }
-
+        if (_mode == JammerMode::Bluetooth) {
             // Partition the channel list across the radios instead of each one
             // picking at random. Radio i strides the list by kNRF24RadioCount
             // starting at offset i, so the radios always hammer three different
-            // channels simultaneously. For BLE (exactly 3 advertising channels)
-            // this becomes a 1:1 lock: each radio nails one adv channel
-            // continuously. For BT/WiFi it interleaves thirds of the band.
+            // channels simultaneously, interleaving thirds of the band.
+            const size_t channelCount = sizeof(kBluetoothChannels);
             for (uint8_t i = 0; i < kNRF24RadioCount; ++i) {
                 if (!_radioReady[i]) {
                     continue;
                 }
                 const uint8_t idx = static_cast<uint8_t>((i + static_cast<size_t>(b) * kNRF24RadioCount) % channelCount);
                 _transmitBurstOnRadio(_radios[i], _radioChannel[i],
-                    channels[idx],
+                    kBluetoothChannels[idx],
+                    radioNoise[i], sizeof(radioNoise[i]), static_cast<uint8_t>(b + i * 31));
+            }
+            continue;
+        }
+
+        if (_mode == JammerMode::Wifi) {
+            // WiFi channels are 20 MHz wide; hitting only the center frequencies
+            // leaves most of each channel clear. Split the 2.4 GHz WiFi band
+            // (nRF ch 1-72, covering WiFi CH1-13) into thirds and have each
+            // radio continuously sweep its sub-band, so the full 20 MHz spans
+            // get blanketed instead of single tones.
+            constexpr uint8_t kWifiBandStart = 1;
+            constexpr uint8_t kWifiSubBand   = 72 / kNRF24RadioCount;  // 24 ch/radio
+            for (uint8_t i = 0; i < kNRF24RadioCount; ++i) {
+                if (!_radioReady[i]) {
+                    continue;
+                }
+                const uint8_t ch = static_cast<uint8_t>(
+                    kWifiBandStart + i * kWifiSubBand + (b % kWifiSubBand));
+                _transmitBurstOnRadio(_radios[i], _radioChannel[i], ch,
                     radioNoise[i], sizeof(radioNoise[i]), static_cast<uint8_t>(b + i * 31));
             }
             continue;
