@@ -79,20 +79,6 @@ bool ESP32NRF24Jammer::beginRadio(uint8_t index) {
     Serial.printf("[nRF24-%u] ERROR: module not found on CE=%u CSN=%u SCK=%u MISO=%u MOSI=%u\n",
         label, _radioConfigs[index].cePin, _radioConfigs[index].csnPin, _radioConfigs[index].sckPin,
         _radioConfigs[index].misoPin, _radioConfigs[index].mosiPin);
-
-    // Diagnostic: write 0x2A to CONFIG and read it back raw.
-    //   0x2A -> module present and answering (should not reach here)
-    //   0xFF -> MISO stuck high / disconnected (no data returning)
-    //   0x00 -> MISO or SCK dead / stuck low
-    //   other -> marginal wiring or power on the shared bus
-    _idleAllChipSelects();
-    const uint8_t raw = _radios[index].readConfigRaw();
-    const char* hint = "marginal bus/power";
-    if (raw == 0xFF)      hint = "MISO stuck HIGH / disconnected";
-    else if (raw == 0x00) hint = "MISO/SCK dead (stuck LOW)";
-    else if (raw == 0x2A) hint = "answered correctly (intermittent!)";
-    Serial.printf("[nRF24-%u] DIAG: CONFIG readback=0x%02X -> %s\n", label, raw, hint);
-
     _radioReady[index] = false;
     return false;
 }

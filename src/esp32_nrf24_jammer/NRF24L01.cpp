@@ -68,12 +68,6 @@ bool NRF24L01::isPresent() {
     return readRegister(REG_CONFIG) == probe;
 }
 
-uint8_t NRF24L01::readConfigRaw() {
-    const uint8_t probe = 0x2A;
-    writeRegister(REG_CONFIG, probe);
-    return readRegister(REG_CONFIG);
-}
-
 void NRF24L01::writeRegister(uint8_t reg, uint8_t value) {
     activateBus();
     digitalWrite(_csnPin, LOW);
