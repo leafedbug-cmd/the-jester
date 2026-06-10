@@ -11,14 +11,18 @@ constexpr int8_t  kLedPin        = 48;
 constexpr uint8_t kBootButtonPin = 0;
 constexpr uint8_t kModeCount     = 5;
 
+// Shared SPI bus — one wire from each of these pins fans out to all radios.
+constexpr uint8_t kRadioSckPin  = 12;
+constexpr uint8_t kRadioMosiPin = 11;
+constexpr uint8_t kRadioMisoPin = 13;
+
+// Per-radio chip enable / chip select (unique to each module).
 constexpr uint8_t kRadio1CePin  = 4;
 constexpr uint8_t kRadio1CsnPin = 5;
-constexpr uint8_t kRadioSckPin  = 6;
-constexpr uint8_t kRadioMosiPin = 7;
-constexpr uint8_t kRadioMisoPin = 15;
-
-constexpr uint8_t kRadio2CePin  = 16;
-constexpr uint8_t kRadio2CsnPin = 17;
+constexpr uint8_t kRadio2CePin  = 6;
+constexpr uint8_t kRadio2CsnPin = 7;
+constexpr uint8_t kRadio3CePin  = 8;
+constexpr uint8_t kRadio3CsnPin = 9;
 
 SPIClass gRadioSpi(FSPI);
 Preferences gPreferences;
@@ -34,9 +38,12 @@ NRF24RadioConfig makeRadioConfig(SPIClass& spi, uint8_t cePin, uint8_t csnPin) {
     return config;
 }
 
-NRF24RadioConfig gPrimaryRadioConfig   = makeRadioConfig(gRadioSpi, kRadio1CePin, kRadio1CsnPin);
-NRF24RadioConfig gSecondaryRadioConfig = makeRadioConfig(gRadioSpi, kRadio2CePin, kRadio2CsnPin);
-ESP32NRF24Jammer gJammer(kLedPin, gPrimaryRadioConfig, gSecondaryRadioConfig);
+NRF24RadioConfig gRadioConfigs[kNRF24RadioCount] = {
+    makeRadioConfig(gRadioSpi, kRadio1CePin, kRadio1CsnPin),
+    makeRadioConfig(gRadioSpi, kRadio2CePin, kRadio2CsnPin),
+    makeRadioConfig(gRadioSpi, kRadio3CePin, kRadio3CsnPin),
+};
+ESP32NRF24Jammer gJammer(kLedPin, gRadioConfigs);
 
 // RGB party state for ALL mode
 uint8_t gPartyHue = 0;
@@ -120,18 +127,32 @@ void setup() {
 
     pinMode(kBootButtonPin, INPUT_PULLUP);
 
-    Serial.println("[APP] Probing primary nRF24L01+ radio...");
-    if (gJammer.beginPrimary()) {
-        Serial.println("[APP] Primary radio OK");
-    } else {
-        Serial.println("[APP] Primary radio FAILED");
+    for (uint8_t i = 0; i < kNRF24RadioCount; ++i) {
+        Serial.printf("[APP] Probing nRF24L01+ radio %u...\n", i + 1);
+        if (gJammer.beginRadio(i)) {
+            Serial.printf("[APP] Radio %u OK\n", i + 1);
+        } else {
+            Serial.printf("[APP] Radio %u FAILED\n", i + 1);
+        }
     }
 
-    Serial.println("[APP] Probing secondary nRF24L01+ radio...");
-    if (gJammer.beginSecondary()) {
-        Serial.println("[APP] Secondary radio OK");
-    } else {
-        Serial.println("[APP] Secondary radio FAILED");
+    // Keep working radios keyed even if a presence read-back flaps mid-run.
+    gJammer.setTrustMode(true);
+
+    // Green blink once per radio detected at boot, as a count indicator
+    // (3 blinks = all three up, 2 = two up, etc.).
+    const uint8_t readyRadios = gJammer.getReadyRadioCount();
+    if (readyRadios > 0) {
+        Serial.printf("[APP] %u radio(s) enumerated - green confirmation blink\n", readyRadios);
+        neopixelWrite(kLedPin, 0, 0, 0);
+        delay(400);  // dark lead-in so the blinks read as distinct from boot
+        for (uint8_t blink = 0; blink < readyRadios; ++blink) {
+            neopixelWrite(kLedPin, 0, 255, 0);
+            delay(350);
+            neopixelWrite(kLedPin, 0, 0, 0);
+            delay(300);
+        }
+        delay(250);  // settle before the steady mode color takes over
     }
 
     gJammer.setMode(JammerMode::Bluetooth);
@@ -168,10 +189,11 @@ void loop() {
 
     if ((millis() - lastHeartbeatMs) > 30000) {
         lastHeartbeatMs = millis();
-        Serial.printf("[APP] Heap=%uKB R1=%s R2=%s Mode=%s\n",
+        Serial.printf("[APP] Heap=%uKB R1=%s R2=%s R3=%s Mode=%s\n",
             ESP.getFreeHeap() / 1024,
-            gJammer.isPrimaryRadioReady()   ? "OK" : "OFF",
-            gJammer.isSecondaryRadioReady() ? "OK" : "OFF",
+            gJammer.isRadioReady(0) ? "OK" : "OFF",
+            gJammer.isRadioReady(1) ? "OK" : "OFF",
+            gJammer.isRadioReady(2) ? "OK" : "OFF",
             jammerModeName(gJammer.getMode()));
     }
 

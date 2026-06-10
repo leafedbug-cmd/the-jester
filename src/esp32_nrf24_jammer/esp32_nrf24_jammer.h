@@ -25,27 +25,29 @@ struct NRF24RadioConfig {
     uint8_t mosiPin = 0;
 };
 
+// Number of nRF24 radios wired onto the shared SPI bus.
+constexpr uint8_t kNRF24RadioCount = 3;
+
 struct JammerStateSnapshot {
     JammerMode mode = JammerMode::Bluetooth;
     bool radioReady = false;
-    bool primaryRadioReady = false;
-    bool secondaryRadioReady = false;
+    bool radioReadyFlags[kNRF24RadioCount] = {false};
     bool jamming = false;
     uint8_t radiosReady = 0;
 };
 
 class ESP32NRF24Jammer {
 public:
-    ESP32NRF24Jammer(int8_t ledPin, const NRF24RadioConfig& primaryRadioConfig, const NRF24RadioConfig& secondaryRadioConfig);
+    ESP32NRF24Jammer(int8_t ledPin, const NRF24RadioConfig (&radioConfigs)[kNRF24RadioCount]);
 
-    bool beginPrimary();
-    bool beginSecondary();
+    // Probe a single radio by index [0..kNRF24RadioCount-1].
+    bool beginRadio(uint8_t index);
+    // Probe every configured radio; returns true if at least one came up.
+    bool beginAll();
     bool isRadioReady() const;
-    bool isPrimaryRadioReady() const;
-    bool isSecondaryRadioReady() const;
+    bool isRadioReady(uint8_t index) const;
     uint8_t getReadyRadioCount() const;
-    void setPrimaryRadioConfig(const NRF24RadioConfig& radioConfig);
-    void setSecondaryRadioConfig(const NRF24RadioConfig& radioConfig);
+    void setRadioConfig(uint8_t index, const NRF24RadioConfig& radioConfig);
 
     bool setMode(JammerMode mode);
     JammerMode getMode() const;
@@ -55,28 +57,31 @@ public:
     bool isSafeMode() const;
     bool isJamming() const;
 
+    // Trust mode: once a radio has come up, keep it keyed even if a later
+    // presence read-back flaps (e.g. brief brown-out). Radios that never came
+    // up are still retried by the recovery loop. Default off.
+    void setTrustMode(bool enable);
+    bool isTrustMode() const;
+
     void getStateSnapshot(JammerStateSnapshot& snapshot);
 
 private:
     int8_t _ledPin;
-    NRF24RadioConfig _primaryRadioConfig;
-    NRF24RadioConfig _secondaryRadioConfig;
-    NRF24L01 _primaryRadio;
-    NRF24L01 _secondaryRadio;
+    NRF24RadioConfig _radioConfigs[kNRF24RadioCount];
+    NRF24L01 _radios[kNRF24RadioCount];
+    bool _radioReady[kNRF24RadioCount] = {false};
+    uint8_t _radioChannel[kNRF24RadioCount] = {0};
 
     JammerMode _mode = JammerMode::Bluetooth;
     bool _safeMode = false;
     bool _isJamming = false;
-    bool _primaryRadioReady = false;
-    bool _secondaryRadioReady = false;
-    uint8_t _primaryChannel = 0;
-    uint8_t _secondaryChannel = 0;
-    uint8_t _allPattern = 0;
+    bool _trustMode = false;
     unsigned long _lastHealthCheckMs = 0;
     unsigned long _lastRecoveryAttemptMs = 0;
 
     portMUX_TYPE _stateMux = portMUX_INITIALIZER_UNLOCKED;
 
+    void _idleAllChipSelects();
     void _refreshRadioPresence();
     void _recoverMissingRadios();
     void _transmitBurstOnRadio(NRF24L01& radio, uint8_t& currentChannel, uint8_t channel, uint8_t* noise, size_t noiseLength, uint8_t burstSeed);

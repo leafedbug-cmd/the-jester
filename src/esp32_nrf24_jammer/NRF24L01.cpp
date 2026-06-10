@@ -37,6 +37,13 @@ bool NRF24L01::begin() {
     return isPresent();
 }
 
+void NRF24L01::deselect() {
+    pinMode(_csnPin, OUTPUT);
+    pinMode(_cePin, OUTPUT);
+    digitalWrite(_csnPin, HIGH);  // deselected
+    digitalWrite(_cePin, LOW);
+}
+
 void NRF24L01::powerDown() {
     uint8_t config = readRegister(REG_CONFIG);
     config &= static_cast<uint8_t>(~0x02);
@@ -59,6 +66,12 @@ bool NRF24L01::isPresent() {
     const uint8_t probe = 0x2A;
     writeRegister(REG_CONFIG, probe);
     return readRegister(REG_CONFIG) == probe;
+}
+
+uint8_t NRF24L01::readConfigRaw() {
+    const uint8_t probe = 0x2A;
+    writeRegister(REG_CONFIG, probe);
+    return readRegister(REG_CONFIG);
 }
 
 void NRF24L01::writeRegister(uint8_t reg, uint8_t value) {
