@@ -263,11 +263,11 @@ static esp_ble_scan_params_t wdBleScanParams = {
 #define WD_TAB_BLE   1
 #define WD_TAB_BT    2
 #define WD_TAB_RF    3
-#define WD_TAB_H    24
-#define WD_LIST_TOP (TITLE_H + WD_TAB_H)   // y=64
+#define WD_TAB_H    32
+#define WD_LIST_TOP (TITLE_H + WD_TAB_H)   // y=72
 #define WD_LIST_BOT 298
-#define WD_ROW_H    18
-#define WD_VISIBLE  ((WD_LIST_BOT - WD_LIST_TOP) / WD_ROW_H)  // 13 rows
+#define WD_ROW_H    24
+#define WD_VISIBLE  ((WD_LIST_BOT - WD_LIST_TOP) / WD_ROW_H)  // 9 rows
 
 static const uint16_t wdTabCol[]   = {0x07FF, 0xC01F, 0xF800, 0x07E3};  // bright: cyan, violet, red, lime
 static const char   * wdTabLabel[] = {"WIFI", "BLE", "BT", "RF"};
@@ -552,16 +552,27 @@ static bool macEq(const uint8_t *a, const uint8_t *b) { return memcmp(a,b,6)==0;
 // ---- SD logging ------------------------------------------------------------
 static void wdEnsureDir() {
   if (!sdOk) return;
-  if (!SD_MMC.exists("/sdcard/jester")) SD_MMC.mkdir("/sdcard/jester");
+  // SD_MMC paths are relative to its /sdcard VFS mount point.
+  if (!SD_MMC.exists("/jester")) SD_MMC.mkdir("/jester");
 }
 
-static void wdAppend(const char *line) {
-  if (!sdOk || !wdLogFile[0]) return;
+static bool wdAppend(const char *line) {
+  if (!sdOk || !wdLogFile[0]) return false;
   File f = SD_MMC.open(wdLogFile, FILE_APPEND);
-  if (!f) return;
-  f.print(line);
+  if (!f) {
+    Serial.printf("Wardrive: failed to open %s\n", wdLogFile);
+    return false;
+  }
+  size_t expected = strlen(line);
+  size_t written = f.print(line);
   f.close();
+  if (written != expected) {
+    Serial.printf("Wardrive: short write to %s (%u/%u bytes)\n",
+                  wdLogFile, (unsigned)written, (unsigned)expected);
+    return false;
+  }
   wdLoggedCount++;
+  return true;
 }
 
 static void wdLogWifi(int i) {
@@ -570,8 +581,7 @@ static void wdLogWifi(int i) {
   sprintf(line, "%lu,WIFI,%s,%s,%d,%d,%d,%d\n",
           millis()-wdSessionMs, wdWifi[i].ssid, mac,
           (int)wdWifi[i].rssi, wdWifi[i].channel, wdWifi[i].auth, wdWifi[i].seenCount);
-  wdAppend(line);
-  wdWifi[i].logged = true;
+  wdWifi[i].logged = wdAppend(line);
 }
 
 static void wdLogBle(int i) {
@@ -580,8 +590,7 @@ static void wdLogBle(int i) {
   sprintf(line, "%lu,BLE,%s,%s,%d,0,0,%d\n",
           millis()-wdSessionMs, wdBle[i].name[0] ? wdBle[i].name : "?",
           mac, (int)wdBle[i].rssi, wdBle[i].seenCount);
-  wdAppend(line);
-  wdBle[i].logged = true;
+  wdBle[i].logged = wdAppend(line);
 }
 
 static void wdLogBt(int i) {
@@ -590,8 +599,7 @@ static void wdLogBt(int i) {
   sprintf(line, "%lu,BT,%s,%s,%d,0,0,%d\n",
           millis()-wdSessionMs, wdBt[i].name[0] ? wdBt[i].name : "?",
           mac, (int)wdBt[i].rssi, wdBt[i].seenCount);
-  wdAppend(line);
-  wdBt[i].logged = true;
+  wdBt[i].logged = wdAppend(line);
 }
 
 // ---- device table helpers --------------------------------------------------
@@ -675,9 +683,9 @@ static void drawWdTabs() {
     uint16_t col = sel ? wdTabCol[t] : (uint16_t)((wdTabCol[t] >> 1) & 0x7BEF);
     gfx->fillRect(tx, TITLE_H, 120, WD_TAB_H, sel ? 0x0820 : 0x0000);
     gfx->drawRect(tx, TITLE_H, 120, WD_TAB_H, sel ? col : COL_DIVIDER);
-    gfx->setTextColor(sel ? col : COL_LABEL); gfx->setTextSize(1);
-    int lw = strlen(wdTabLabel[t]) * 6;
-    gfx->setCursor(tx + (120-lw)/2, TITLE_H + 8); gfx->print(wdTabLabel[t]);
+    gfx->setTextColor(sel ? col : COL_LABEL); gfx->setTextSize(2);
+    int lw = strlen(wdTabLabel[t]) * 12;
+    gfx->setCursor(tx + (120-lw)/2, TITLE_H + (WD_TAB_H-16)/2); gfx->print(wdTabLabel[t]);
     // Count badge
     uint8_t cnt = (t==0)?wdWifiCount:(t==1)?wdBleCount:(t==2)?wdBtCount:0;
     if (cnt > 0) {
@@ -697,47 +705,72 @@ static void drawSigBars(int x, int y, int8_t rssi, uint16_t col) {
 static void drawWdRow(int row, int di, uint8_t tab) {
   int y = WD_LIST_TOP + row * WD_ROW_H;
   gfx->fillRect(0, y, 480, WD_ROW_H, (row&1) ? 0x0820 : 0x0000);
-  gfx->setTextSize(1);
+  char tmp[16];
 
   if (tab == WD_TAB_WIFI && di < (int)wdWifiCount) {
     WdWifi &d = wdWifi[di];
     uint16_t c = wdTabCol[0];
-    drawSigBars(2, y+4, d.rssi, c);
-    char nm[25]; strncpy(nm, d.ssid, 24); nm[24]='\0';
+    drawSigBars(2, y+5, d.rssi, c);
+    char nm[12]; strncpy(nm, d.ssid, 11); nm[11]='\0';
+    gfx->setTextSize(2);
     gfx->setTextColor(d.logged ? c : (uint16_t)0xFFFF);
-    gfx->setCursor(32, y+5); gfx->print(nm);
-    char tmp[10];
-    sprintf(tmp,"CH%d",d.channel); gfx->setTextColor(c); gfx->setCursor(256,y+5); gfx->print(tmp);
-    sprintf(tmp,"%4d",(int)d.rssi);                      gfx->setCursor(300,y+5); gfx->print(tmp);
-    gfx->setCursor(348, y+5); gfx->print(authLabel(d.auth));
-    sprintf(tmp,"x%d",d.seenCount); gfx->setTextColor(COL_SECONDARY); gfx->setCursor(400,y+5); gfx->print(tmp);
-    if (d.logged) { gfx->setTextColor(0x07E0); gfx->setCursor(452,y+5); gfx->print("SD"); }
+    gfx->setCursor(32, y+4); gfx->print(nm);
+    gfx->setTextColor(c);
+    sprintf(tmp, "C%d", d.channel);
+    gfx->setCursor(168, y+4); gfx->print(tmp);
+    sprintf(tmp, "%4d", (int)d.rssi);
+    gfx->setCursor(216, y+4); gfx->print(tmp);
+    gfx->setTextSize(1);
+    gfx->setTextColor(COL_LABEL);
+    gfx->setCursor(278, y+8); gfx->print(authLabel(d.auth));
+    sprintf(tmp, "x%d", d.seenCount);
+    gfx->setTextColor(COL_SECONDARY);
+    gfx->setCursor(390, y+8); gfx->print(tmp);
+    if (d.logged) { gfx->setTextColor(0x07E0); gfx->setCursor(452, y+8); gfx->print("SD"); }
 
   } else if (tab == WD_TAB_BLE && di < (int)wdBleCount) {
     WdBle &d = wdBle[di];
     uint16_t c = wdTabCol[1];
-    drawSigBars(2, y+4, d.rssi, c);
+    drawSigBars(2, y+5, d.rssi, c);
+    char nm[12]; strncpy(nm, d.name[0] ? d.name : "Unknown", 11); nm[11]='\0';
+    gfx->setTextSize(2);
     gfx->setTextColor(d.logged ? c : (uint16_t)0xFFFF);
-    gfx->setCursor(32, y+5); gfx->print(d.name[0] ? d.name : "Unknown");
+    gfx->setCursor(32, y+4); gfx->print(nm);
     char mac[18]; macToStr(d.addr, mac);
-    gfx->setTextColor(COL_SECONDARY); gfx->setCursor(200,y+5); gfx->print(mac);
-    char tmp[8]; sprintf(tmp,"%4d",(int)d.rssi);
-    gfx->setTextColor(c); gfx->setCursor(352,y+5); gfx->print(tmp);
-    sprintf(tmp,"x%d",d.seenCount); gfx->setTextColor(COL_SECONDARY); gfx->setCursor(398,y+5); gfx->print(tmp);
-    if (d.logged) { gfx->setTextColor(0x07E0); gfx->setCursor(450,y+5); gfx->print("SD"); }
+    gfx->setTextSize(1);
+    gfx->setTextColor(COL_SECONDARY);
+    gfx->setCursor(178, y+8); gfx->print(mac);
+    gfx->setTextSize(2);
+    gfx->setTextColor(c);
+    sprintf(tmp, "%4d", (int)d.rssi);
+    gfx->setCursor(300, y+4); gfx->print(tmp);
+    gfx->setTextSize(1);
+    sprintf(tmp, "x%d", d.seenCount);
+    gfx->setTextColor(COL_SECONDARY);
+    gfx->setCursor(390, y+8); gfx->print(tmp);
+    if (d.logged) { gfx->setTextColor(0x07E0); gfx->setCursor(452, y+8); gfx->print("SD"); }
 
   } else if (tab == WD_TAB_BT && di < (int)wdBtCount) {
     WdBt &d = wdBt[di];
     uint16_t c = wdTabCol[2];
-    drawSigBars(2, y+4, d.rssi, c);
+    drawSigBars(2, y+5, d.rssi, c);
+    char nm[12]; strncpy(nm, d.name[0] ? d.name : "Unknown", 11); nm[11]='\0';
+    gfx->setTextSize(2);
     gfx->setTextColor(d.logged ? c : (uint16_t)0xFFFF);
-    gfx->setCursor(32, y+5); gfx->print(d.name[0] ? d.name : "Unknown");
+    gfx->setCursor(32, y+4); gfx->print(nm);
     char mac[18]; macToStr(d.addr, mac);
-    gfx->setTextColor(COL_SECONDARY); gfx->setCursor(200,y+5); gfx->print(mac);
-    char tmp[8]; sprintf(tmp,"%4d",(int)d.rssi);
-    gfx->setTextColor(c); gfx->setCursor(352,y+5); gfx->print(tmp);
-    sprintf(tmp,"x%d",d.seenCount); gfx->setTextColor(COL_SECONDARY); gfx->setCursor(398,y+5); gfx->print(tmp);
-    if (d.logged) { gfx->setTextColor(0x07E0); gfx->setCursor(450,y+5); gfx->print("SD"); }
+    gfx->setTextSize(1);
+    gfx->setTextColor(COL_SECONDARY);
+    gfx->setCursor(178, y+8); gfx->print(mac);
+    gfx->setTextSize(2);
+    gfx->setTextColor(c);
+    sprintf(tmp, "%4d", (int)d.rssi);
+    gfx->setCursor(300, y+4); gfx->print(tmp);
+    gfx->setTextSize(1);
+    sprintf(tmp, "x%d", d.seenCount);
+    gfx->setTextColor(COL_SECONDARY);
+    gfx->setCursor(390, y+8); gfx->print(tmp);
+    if (d.logged) { gfx->setTextColor(0x07E0); gfx->setCursor(452, y+8); gfx->print("SD"); }
   }
 }
 
@@ -990,7 +1023,7 @@ void runWardrive() {
 static void logsLoadFiles() {
   logFileCount = 0;
   if (!sdOk) return;
-  File dir = SD_MMC.open("/sdcard/jester");
+  File dir = SD_MMC.open("/jester");
   if (!dir || !dir.isDirectory()) return;
   File f;
   while (logFileCount < LOGS_MAX_FILES && (f = dir.openNextFile())) {
@@ -1159,6 +1192,16 @@ void activateMode(Mode mode) {
     return;
   }
 
+  // Exiting LOGS: release the SD pins back to Radio A.
+  if (currentMode == LOGS && mode != LOGS) {
+    SD_MMC.end(); sdOk = false;
+    if (radioAok) configureRadio(radioA, selectRadioA);
+    if (radioBok) configureRadio(radioB, selectRadioB);
+    currentMode = mode;
+    drawUI();
+    return;
+  }
+
   // Entering WARDRIVE
   if (mode == WARDRIVE) {
     wdWifiCount = 0; wdBleCount = 0; wdBtCount = 0;
@@ -1167,7 +1210,7 @@ void activateMode(Mode mode) {
     memset(wdSpectrumPrev, 0, sizeof(wdSpectrumPrev));
     wdScanPending = false; lastWdWifiMs = 0; wdBtScanMs = 0;
     lastWdNrfMs = 0; wdLoggedCount = 0; wdSessionMs = millis();
-    sprintf(wdLogFile, "/sdcard/jester/%lu.csv", wdSessionMs / 1000);
+    sprintf(wdLogFile, "/jester/%lu.csv", wdSessionMs / 1000);
     // Power down Radio A so GPIO 9/10/11 can be used by SD_MMC
     if (radioAok) { selectRadioA(); radioA.powerDown(); spiHSPI.end(); }
     // Mount SD_MMC (1-bit, GPIO 9/10/11)
@@ -1199,6 +1242,11 @@ void activateMode(Mode mode) {
 
   // Entering LOGS
   if (mode == LOGS) {
+    // The card is normally unmounted because its pins are shared with Radio A.
+    if (radioAok) { selectRadioA(); radioA.powerDown(); spiHSPI.end(); }
+    SD_MMC.setPins(SD_CLK, SD_CMD, SD_D0);
+    sdOk = SD_MMC.begin("/sdcard", true);
+    if (sdOk) wdEnsureDir();
     logsSelFile = -1; logsScroll = 0; logsFileScroll = 0;
     logsLoadFiles();
     currentMode = LOGS;
@@ -2126,7 +2174,7 @@ void setup() {
   SD_MMC.setPins(SD_CLK, SD_CMD, SD_D0);
   sdOk = SD_MMC.begin("/sdcard", true /*1-bit mode*/);
   if (sdOk) {
-    if (!SD_MMC.exists("/sdcard/jester")) SD_MMC.mkdir("/sdcard/jester");
+    if (!SD_MMC.exists("/jester")) SD_MMC.mkdir("/jester");
     Serial.println("SD OK");
   } else {
     Serial.println("SD not found — wardrive logging disabled");
