@@ -247,6 +247,7 @@ static volatile bool wdNeedRedraw   = false;
 
 static uint8_t wdSpectrum[126]     = {};
 static uint8_t wdSpectrumPrev[126] = {};
+static bool    wdRfStaticDrawn     = false;
 
 static esp_ble_scan_params_t wdBleScanParams = {
   .scan_type          = BLE_SCAN_TYPE_PASSIVE,
@@ -740,27 +741,115 @@ static void drawWdRow(int row, int di, uint8_t tab) {
   }
 }
 
+static void drawWdRfStatic() {
+  const int ctop    = WD_LIST_TOP;
+  const int cbot    = WD_LIST_BOT;
+  const int axis_y  = cbot - 26;
+  const int strip_h = 10;
+  const int bar_top = ctop + strip_h;
+  const int bar_h   = axis_y - bar_top;
+
+  gfx->fillRect(0, ctop, 480, cbot - ctop, 0x0000);
+
+  // Dim teal shading for WiFi channel bands in top strip
+  const int wRanges[][2] = {{1,23},{26,48},{51,73}};
+  for (auto &r : wRanges) {
+    int x1 = (r[0]*480)/126, x2 = (r[1]*480)/126;
+    gfx->fillRect(x1, ctop, x2-x1, strip_h, 0x0210);
+  }
+  // BLE adv channel markers in strip
+  const int bleAdv[] = {2, 26, 80};
+  for (int b : bleAdv) {
+    int bx = (b*480)/126;
+    gfx->drawFastVLine(bx, ctop, strip_h, 0xF81F);
+  }
+  // WiFi labels in strip (size 1, cyan)
+  gfx->setTextSize(1); gfx->setTextColor(0x07FF);
+  gfx->setCursor(((1+23)*240/126) - 6,  ctop+1); gfx->print("W1");
+  gfx->setCursor(((26+48)*240/126) - 9, ctop+1); gfx->print("W6");
+  gfx->setCursor(((51+73)*240/126) - 12,ctop+1); gfx->print("W11");
+  // BLE channel labels (size 1, magenta)
+  gfx->setTextColor(0xF81F);
+  { int lx = (2*480)/126 - 3;  if (lx<0) lx=0; gfx->setCursor(lx, ctop+1); gfx->print("37"); }
+  { int lx = (26*480)/126 + 2; gfx->setCursor(lx, ctop+1); gfx->print("38"); }
+  { int lx = (80*480)/126 + 2; gfx->setCursor(lx, ctop+1); gfx->print("39"); }
+
+  // Horizontal dotted grid lines at 25/50/75% of bar area
+  for (int p = 1; p <= 3; p++) {
+    int gy = axis_y - (bar_h * p / 4);
+    for (int x = 0; x < 480; x += 4) gfx->drawPixel(x, gy, 0x2104);
+  }
+
+  // Axis line
+  gfx->drawFastHLine(0, axis_y, 480, 0x4208);
+
+  // Freq tick marks + MHz labels every 25 MHz
+  static const int   tickCh[]  = {0, 25, 50, 75, 100, 125};
+  static const char* tickLbl[] = {"2400","2425","2450","2475","2500","2525"};
+  gfx->setTextSize(1); gfx->setTextColor(0x7BEF);
+  for (int i = 0; i < 6; i++) {
+    int tx = (tickCh[i]*480)/126;
+    gfx->drawFastVLine(tx, axis_y, 4, 0x7BEF);
+    int lx = tx - (int)(strlen(tickLbl[i])*3);
+    if (lx < 0) lx = 0;
+    if (lx + (int)strlen(tickLbl[i])*6 > 480) lx = 480-(int)strlen(tickLbl[i])*6;
+    gfx->setCursor(lx, axis_y + 5); gfx->print(tickLbl[i]);
+  }
+
+  // Channel name labels row below MHz row
+  struct WdMkr { int ch; const char* lbl; uint16_t col; };
+  static const WdMkr mkrs[] = {
+    {2,  "B37", 0xF81F},
+    {12, "W1",  0x07FF},
+    {26, "B38", 0xF81F},
+    {37, "W6",  0x07FF},
+    {62, "W11", 0x07FF},
+    {80, "B39", 0xF81F},
+  };
+  for (const auto &m : mkrs) {
+    int mx = (m.ch*480)/126;
+    gfx->drawFastVLine(mx, axis_y, 3, m.col);
+    int lx = mx - (int)(strlen(m.lbl)*3);
+    if (lx < 0) lx = 0;
+    if (lx + (int)strlen(m.lbl)*6 > 480) lx = 480-(int)strlen(m.lbl)*6;
+    gfx->setTextColor(m.col);
+    gfx->setCursor(lx, axis_y + 16); gfx->print(m.lbl);
+  }
+  gfx->setTextColor(0x4208);
+  gfx->setCursor(440, axis_y + 16); gfx->print("MHz");
+  (void)bar_h;
+}
+
 static void drawWdList() {
   if (wdTab == WD_TAB_RF) {
-    // Differential update — only repaint columns whose height changed (no full-area clear)
-    const int ctop = WD_LIST_TOP, cbot = WD_LIST_BOT, ch = cbot - ctop;
+    if (!wdRfStaticDrawn) { drawWdRfStatic(); wdRfStaticDrawn = true; }
+    const int strip_h = 10;
+    const int bar_top = WD_LIST_TOP + strip_h;
+    const int bar_bot = WD_LIST_BOT - 26;
+    const int bar_h   = bar_bot - bar_top;
     for (int c = 0; c < 126; c++) {
-      int bx = (c * 480) / 126, bw = ((c+1)*480)/126 - bx;
+      int bx = (c*480)/126, bw = ((c+1)*480)/126 - bx;
       if (bw < 1) bw = 1;
-      int bh    = ((int)wdSpectrum[c]     * ch) / 63;
-      int prevH = ((int)wdSpectrumPrev[c] * ch) / 63;
+      int bh    = ((int)wdSpectrum[c]     * bar_h) / 63;
+      int prevH = ((int)wdSpectrumPrev[c] * bar_h) / 63;
       if (bh == prevH) continue;
       bool isBleAdv = (c==2||c==26||c==80);
-      bool isWifi   = (c<=12)||(c>=21&&c<=33)||(c>=44&&c<=56);
-      uint16_t col  = isBleAdv?0xC01F:(isWifi?0x07FF:(c>=2&&c<=80?0xF800:0x07E0));
-      if (bh > prevH) {
-        gfx->fillRect(bx, cbot-bh, bw, bh-prevH, col);
-        if (bh >= 2) gfx->fillRect(bx, cbot-bh, bw, 2, 0xFFFF);
-        if (prevH >= 2) gfx->fillRect(bx, cbot-prevH, bw, 2, col);
-      } else {
-        gfx->fillRect(bx, cbot-prevH, bw, prevH-bh, 0x0000);
-        if (bh >= 2) gfx->fillRect(bx, cbot-bh, bw, 2, 0xFFFF);
-        else if (bh > 0) gfx->fillRect(bx, cbot-bh, bw, bh, col);
+      bool isWifi   = !isBleAdv && ((c>=1&&c<=23)||(c>=26&&c<=48)||(c>=51&&c<=73));
+      uint16_t col;
+      if (isBleAdv)    col = 0xF81F;
+      else if (isWifi) col = 0x07FF;
+      else if (c<=80)  col = 0xFD20;
+      else             col = 0x3666;
+      gfx->fillRect(bx, bar_top, bw, bar_h, 0x0000);
+      if (bh >= 4) {
+        int mid = bh / 2;
+        uint16_t dimCol = (col >> 1) & 0x7BEF;
+        if (mid > 0)        gfx->fillRect(bx, bar_bot - mid,    bw, mid,           dimCol);
+        int bright_h = bh - mid - 2;
+        if (bright_h > 0)   gfx->fillRect(bx, bar_bot - bh + 2, bw, bright_h,      col);
+        gfx->fillRect(bx, bar_bot - bh, bw, 2, 0xFFFF);
+      } else if (bh > 0) {
+        gfx->fillRect(bx, bar_bot - bh, bw, bh, col);
       }
       wdSpectrumPrev[c] = wdSpectrum[c];
     }
@@ -1073,7 +1162,7 @@ void activateMode(Mode mode) {
   // Entering WARDRIVE
   if (mode == WARDRIVE) {
     wdWifiCount = 0; wdBleCount = 0; wdBtCount = 0;
-    wdScroll = 0; wdTab = 0; wdNeedRedraw = false;
+    wdScroll = 0; wdTab = 0; wdNeedRedraw = false; wdRfStaticDrawn = false;
     memset(wdSpectrum, 0, sizeof(wdSpectrum));
     memset(wdSpectrumPrev, 0, sizeof(wdSpectrumPrev));
     wdScanPending = false; lastWdWifiMs = 0; wdBtScanMs = 0;
@@ -1871,7 +1960,7 @@ void handleTouch() {
         wdTab = newTab; wdScroll = 0;
         // Clear list area first; for RF tab reset prev so differential draws from scratch
         gfx->fillRect(0, WD_LIST_TOP, 480, WD_LIST_BOT-WD_LIST_TOP, 0x0000);
-        if (newTab == WD_TAB_RF) memset(wdSpectrumPrev, 0, sizeof(wdSpectrumPrev));
+        if (newTab == WD_TAB_RF) { memset(wdSpectrumPrev, 0, sizeof(wdSpectrumPrev)); wdRfStaticDrawn = false; }
         drawWdTabs(); drawWdList();
       }
       return;
