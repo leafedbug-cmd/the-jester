@@ -250,7 +250,9 @@ static uint8_t wdSpectrumPrev[126] = {};
 static bool    wdRfStaticDrawn     = false;
 
 static esp_ble_scan_params_t wdBleScanParams = {
-  .scan_type          = BLE_SCAN_TYPE_PASSIVE,
+  // Active scans request the scan-response payload, where many peripherals
+  // place their complete or shortened local name.
+  .scan_type          = BLE_SCAN_TYPE_ACTIVE,
   .own_addr_type      = BLE_ADDR_TYPE_PUBLIC,
   .scan_filter_policy = BLE_SCAN_FILTER_ALLOW_ALL,
   .scan_interval      = 0x50,
@@ -588,7 +590,7 @@ static void wdLogBle(int i) {
   char mac[18]; macToStr(wdBle[i].addr, mac);
   char line[96];
   sprintf(line, "%lu,BLE,%s,%s,%d,0,0,%d\n",
-          millis()-wdSessionMs, wdBle[i].name[0] ? wdBle[i].name : "?",
+          millis()-wdSessionMs, wdBle[i].name[0] ? wdBle[i].name : "Unknown",
           mac, (int)wdBle[i].rssi, wdBle[i].seenCount);
   wdBle[i].logged = wdAppend(line);
 }
@@ -2171,6 +2173,11 @@ void setup() {
 
   // SD card probe — GPIO 9/10/11 (SDMMC 1-bit, shared with Radio A).
   // Probe before Radio A init, then unmount so the pins are free for Radio A.
+  // Hold Radio A inactive first so its MISO output cannot contend with SD D0.
+  pinMode(NRF_CE_A, OUTPUT);
+  digitalWrite(NRF_CE_A, LOW);
+  pinMode(NRF_CSN_A, OUTPUT);
+  digitalWrite(NRF_CSN_A, HIGH);
   SD_MMC.setPins(SD_CLK, SD_CMD, SD_D0);
   sdOk = SD_MMC.begin("/sdcard", true /*1-bit mode*/);
   if (sdOk) {
