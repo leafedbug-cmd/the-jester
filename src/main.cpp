@@ -18,6 +18,8 @@
 #include "Preferences.h"
 #include <Arduino_GFX_Library.h>
 #include "TCA9554.h"
+#include "esp_rom_gpio.h"
+#include "soc/spi_periph.h"
 
 // ---------------------------------------------------------------------------
 // LCD hardware pins  (SPI2/FSPI — internal, NOT on the header)
@@ -98,6 +100,10 @@ RF24 radioB(NRF_CE_B, NRF_CSN_B, SPI_SPEED);
 // Classic Bluetooth sweep counters (NRF24 ch 2–80)
 static uint8_t btSweepA = 2;
 static uint8_t btSweepB = 80;
+
+// BLE sweep counters — same band, both radios from opposite ends
+static uint8_t bleSweepA = 2;
+static uint8_t bleSweepB = 80;
 
 // Spectrum scanner state (SPECTRUM mode — full screen, with peak hold)
 uint8_t gSpectrum[126]         = {0};
@@ -250,16 +256,18 @@ void refreshButtons() {
 // ---------------------------------------------------------------------------
 // Radio config
 // ---------------------------------------------------------------------------
+// Remap SPI3 (HSPI) signals through the GPIO matrix — no end()/begin(), no DMA teardown.
+// spiHSPI is initialized once in setup(); only the physical pin routing changes here.
 void selectRadioA() {
-  spiHSPI.end();
-  delayMicroseconds(50);
-  spiHSPI.begin(NRF_CLK_A, NRF_MISO_A, NRF_MOSI_A, -1);
+  esp_rom_gpio_connect_out_signal(NRF_CLK_A,  spi_periph_signal[HSPI].spiclk_out, false, false);
+  esp_rom_gpio_connect_out_signal(NRF_MOSI_A, spi_periph_signal[HSPI].spid_out,   false, false);
+  esp_rom_gpio_connect_in_signal (NRF_MISO_A, spi_periph_signal[HSPI].spiq_in,    false);
 }
 
 void selectRadioB() {
-  spiHSPI.end();
-  delayMicroseconds(50);
-  spiHSPI.begin(NRF_CLK_B, NRF_MISO_B, NRF_MOSI_B, -1);
+  esp_rom_gpio_connect_out_signal(NRF_CLK_B,  spi_periph_signal[HSPI].spiclk_out, false, false);
+  esp_rom_gpio_connect_out_signal(NRF_MOSI_B, spi_periph_signal[HSPI].spid_out,   false, false);
+  esp_rom_gpio_connect_in_signal (NRF_MISO_B, spi_periph_signal[HSPI].spiq_in,    false);
 }
 
 // Noise payload — 32 bytes of random data, refreshed periodically
@@ -388,24 +396,18 @@ void jamWifi() {
   wifiSweepB = (wifiSweepB + 1) % 7;
 }
 
-// BLE: 3 advertising channels (2, 26, 80) + 37 data channels (4–78)
-// Radio A hammers ALL 3 adv channels every call (8 pkts each) — no rotation.
-// Radio B sweeps 2 data channels per call stepping by 2 (covers band in ~19 calls).
-static const uint8_t bleAdvCh[] = {2, 26, 80};
-
+// BLE: 40 channels spanning NRF24 ch 2–80 (adv at 2, 26, 80; data across the band).
+// Both radios sweep from opposite ends, 1 ch/call each → full band in ~40 calls (~17ms).
+// Advertising channels get 6 pkts when hit (vs 3 for data) to also block new connections.
+// Prior approach only hit adv channels from Radio A + slow Radio B data sweep (~74ms cycle)
+// which missed established connections entirely — this sweeps the full band like jamBluetooth.
 void jamBLE() {
-  static uint8_t bleSweepData = 4;
-  if (radioAok) {
-    for (int i = 0; i < 3; i++)
-      spamChannel(radioA, selectRadioA, bleAdvCh[i], 8);
-  }
-  if (radioBok) {
-    spamChannel(radioB, selectRadioB, bleSweepData, 4);
-    uint8_t next = (bleSweepData + 1 <= 78) ? bleSweepData + 1 : 4;
-    spamChannel(radioB, selectRadioB, next, 4);
-  }
-  bleSweepData += 2;
-  if (bleSweepData > 78) bleSweepData = 4;
+  bool isAdvA = (bleSweepA == 2 || bleSweepA == 26 || bleSweepA == 80);
+  bool isAdvB = (bleSweepB == 2 || bleSweepB == 26 || bleSweepB == 80);
+  if (radioAok) spamChannel(radioA, selectRadioA, bleSweepA, isAdvA ? 6 : 3);
+  if (radioBok) spamChannel(radioB, selectRadioB, bleSweepB, isAdvB ? 6 : 3);
+  bleSweepA++; if (bleSweepA > 80) bleSweepA = 2;
+  bleSweepB--; if (bleSweepB < 2)  bleSweepB = 80;
 }
 
 // Classic Bluetooth: 79 channels (NRF24 ch 2–80)
@@ -991,6 +993,9 @@ void setup() {
   esp_wifi_stop();
   esp_wifi_deinit();
   esp_wifi_disconnect();
+
+  // Initialize SPI3 (HSPI) once — selectRadioA/B only remap GPIO matrix from here on
+  spiHSPI.begin(NRF_CLK_A, NRF_MISO_A, NRF_MOSI_A, -1);
 
   Serial.println("Initializing Radio A (CE=" + String(NRF_CE_A) + " CSN=" + String(NRF_CSN_A) +
                  " SCK=" + String(NRF_CLK_A) + " MOSI=" + String(NRF_MOSI_A) +
