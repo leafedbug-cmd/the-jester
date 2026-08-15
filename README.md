@@ -5,6 +5,8 @@
   <p>A fully open-source Bluetooth and BLE jammer based on the [RF-Clown project by cifertech](https://github.com/cifertech/RF-Clown). This implementation uses dual nRF24L01 modules with ESP32 for simultaneous BLE and Bluetooth operations, featuring serial command control and LED status indication.</p>
 </div>
 
+> This checkout contains the Waveshare ESP32-S3-Touch-LCD-3.5 port on branch `Jester-esp32waveshare3.5touch`. See [repository identity and recovery details](docs/REPOSITORY-IDENTITY.md).
+
 ## ⚠️ Disclaimer
 
 This project is intended for educational purposes, security research, and testing in controlled environments only. Use responsibly and in accordance with local laws and regulations.
