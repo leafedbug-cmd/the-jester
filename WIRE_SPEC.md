@@ -1,4 +1,4 @@
-# The Jester — Lonely Binary (Sparkle IoT S3N16R8) Wiring Spec
+# The Jester — Sparkle IoT S3N16R8 Wiring Spec
 
 This branch targets the **Sparkle IoT ESP32-S3N16R8** (XH-S3E module, 16MB flash, 8MB PSRAM OPI) with **three** external `nRF24L01+ PA+LNA` breakout modules on a shared SPI bus.
 
