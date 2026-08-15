@@ -2,7 +2,9 @@
 
 #define CMD_R_REGISTER 0x00
 #define CMD_W_REGISTER 0x20
+#define CMD_REUSE_TX_PL 0xE3
 #define REG_CONFIG 0x00
+#define REG_RF_CH 0x05
 #define NRF24_SPI_FREQUENCY 10000000
 
 namespace {
@@ -202,6 +204,44 @@ void NRF24L01::startConstantCarrier(uint8_t channel) {
     writeRegister(0x06, 0x96);
     setChannel(channel);
     setCEHigh();  // hold CE high -> carrier transmits continuously
+}
+
+void NRF24L01::reuseTxPayload() {
+    activateBus();
+    digitalWrite(_csnPin, LOW);
+    _spi->beginTransaction(SPISettings(NRF24_SPI_FREQUENCY, MSBFIRST, SPI_MODE0));
+    transfer(CMD_REUSE_TX_PL);
+    _spi->endTransaction();
+    digitalWrite(_csnPin, HIGH);
+}
+
+void NRF24L01::startPayloadFlood(uint8_t channel, const uint8_t* payload, uint8_t len) {
+    setCELow();
+    powerUp();
+    setTxMode();
+    disableAutoAck();
+    disableRetransmit();
+    setMaxPower();              // RF_SETUP = 0x27: 250kbps, max PA, CONT_WAVE off
+    setChannel(channel);
+    flushTx();
+    writeTxPayload(payload, len);
+
+    // Transmit the payload once and let it clear the air (~1.3ms for 32B at
+    // 250kbps) so it becomes the "last transmitted" packet — the datasheet
+    // forbids enabling reuse mid-transmission.
+    setCEHigh();
+    delayMicroseconds(20);
+    setCELow();
+    delay(2);
+
+    reuseTxPayload();           // resend last payload until W_TX_PAYLOAD/FLUSH_TX
+    setCEHigh();                // hold high -> continuous back-to-back retransmit
+}
+
+void NRF24L01::retuneFlood(uint8_t channel) {
+    // CE stays high and reuse stays armed; just move the PLL. The brief relock
+    // glitch is irrelevant for jamming and keeps the duty cycle near 100%.
+    writeRegister(REG_RF_CH, channel & 0x7F);
 }
 
 void NRF24L01::activateBus() {

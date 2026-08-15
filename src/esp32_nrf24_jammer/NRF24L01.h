@@ -42,7 +42,19 @@ public:
 
     // Emit a continuous unmodulated carrier on `channel` at max power (100%
     // duty cycle). CE is held high; call powerDown()/setCELow() to stop.
+    // NOTE: CONT_WAVE is weak/absent on many nRF24L01+ clones; prefer the
+    // modulated flood below for real-world jamming.
     void startConstantCarrier(uint8_t channel);
+
+    // Modulated max-power flood on `channel`: load `payload`, mark it for reuse
+    // (REUSE_TX_PL) and hold CE high so the radio retransmits it back-to-back at
+    // ~100% duty with no per-packet SPI overhead. Keys the PA reliably (unlike
+    // CONT_WAVE) and occupies channel bandwidth. Stop with powerDown()+setCELow().
+    void startPayloadFlood(uint8_t channel, const uint8_t* payload, uint8_t len);
+
+    // Move a running flood to a new channel with minimal overhead — CE stays
+    // high and reuse stays armed, so TX never stops. Used for fast band sweeps.
+    void retuneFlood(uint8_t channel);
 
 private:
     SPIClass* _spi = nullptr;
@@ -55,6 +67,7 @@ private:
 
     void activateBus();
     uint8_t transfer(uint8_t value);
+    void reuseTxPayload();  // REUSE_TX_PL command (0xE3)
 };
 
 #endif

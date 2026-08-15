@@ -85,23 +85,23 @@ Press the **BOOT** button to cycle: ANALYZE → BLUETOOTH → BLE → BOTH → A
 ```
 Sparkle IoT ESP32-S3N16R8
          ┌────────────────────────────────────┐
-  GPIO11 ─┤──┬──┬───────────────► SCK  (R1/R2/R3) │
-  GPIO10 ─┤──┼──┼───────────────► MO   (R1/R2/R3) │
-  GPIO15 ─┤──┼──┼───────────────► MI   (R1/R2/R3) │
-    3.3V ─┤──┼──┼───────────────► VCC  (R1/R2/R3) │
+  GPIO12 ─┤──┬──┬───────────────► SCK  (R1/R2/R3) │
+  GPIO11 ─┤──┼──┼───────────────► MO   (R1/R2/R3) │
+  GPIO13 ─┤──┼──┼───────────────► MI   (R1/R2/R3) │
+  ext3.3V ─┤──┼──┼───────────────► VCC  (R1/R2/R3) │
      GND ─┤──┴──┴───────────────► GND  (R1/R2/R3) │
-  GPIO12 ─┤────────────────────► Radio 1 CE      │
-  GPIO13 ─┤────────────────────► Radio 1 CSN     │
-  GPIO14 ─┤────────────────────► Radio 2 CE      │
-   GPIO1 ─┤────────────────────► Radio 2 CSN     │
-  GPIO40 ─┤────────────────────► Radio 3 CE      │
-  GPIO39 ─┤────────────────────► Radio 3 CSN     │
+   GPIO4 ─┤────────────────────► Radio 1 CE      │
+   GPIO5 ─┤────────────────────► Radio 1 CSN     │
+   GPIO6 ─┤────────────────────► Radio 2 CE      │
+   GPIO7 ─┤────────────────────► Radio 2 CSN     │
+   GPIO8 ─┤────────────────────► Radio 3 CE      │
+   GPIO9 ─┤────────────────────► Radio 3 CSN     │
   GPIO48 ─┤  RGB WS2812 (onboard)               │
    GPIO0 ─┤  BOOT button (onboard)              │
          └────────────────────────────────────┘
 ```
 
-SCK (GPIO 11), MOSI (GPIO 10), and MISO (GPIO 15) are shared across all three modules — run one wire from each ESP32 pin to every radio board. Only CE/CSN are unique per radio.
+SCK (GPIO 12), MOSI (GPIO 11), and MISO (GPIO 13) are shared across all three modules — run one wire from each ESP32 pin to every radio board. Only CE/CSN are unique per radio. VCC comes from the external 3.3V supply, not the ESP32 (see Power section above).
 
 ---
 
